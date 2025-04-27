@@ -1,6 +1,6 @@
 # Llama Server CLI
 
-A simple, user-friendly CLI tool for managing and running llama-server with multiple configuration profiles.
+A simple, user-friendly CLI tool for managing, and running, llama-server with multiple configuration profiles and providing OpenAI-compatible API access.
 
 ## Installation
 
