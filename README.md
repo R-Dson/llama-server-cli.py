@@ -9,7 +9,7 @@ A simple, user-friendly CLI tool for managing and running llama-server with mult
 2. Install the required Python packages:
 
 ```bash
-pip install typer rich questionary prompt_toolkit
+pip install typer rich questionary prompt_toolkit fastapi uvicorn
 ```
 
 3. Create a `gguf` folder for your models if you don't already have one:
@@ -48,6 +48,7 @@ In interactive mode, you can:
 - Start the server in the background
 - Change settings with instant auto-restart
 - Select models from a list of available GGUF files
+- Configure and manage the OpenAI-compatible API server
 
 ### Command-Line Arguments (Advanced)
 
@@ -65,6 +66,12 @@ python llama-server-cli.py profile list
 
 # Start server with a specific profile
 python llama-server-cli.py server start --profile my_profile
+
+# Start OpenAI-compatible API server
+python llama-server-cli.py api start
+
+# Stop API server (if needed)
+python llama-server-cli.py api stop
 ```
 
 ## Quick Start
@@ -82,6 +89,15 @@ python llama-server-cli.py
    - Choose "Set model" and select your model from the list
    - Adjust other settings as needed
    - Start the server with your profile
+
+## OpenAI API Compatibility
+
+The tool includes an OpenAI-compatible API server that allows you to use your local llama-server with applications that support the OpenAI API format:
+
+1. **API Configuration**: Configure the API server host and port through the interactive menu or config.json
+2. **Automatic Profile Switching**: The API server automatically switches between profiles based on the requested model
+3. **Chat Completions**: Supports the `/v1/chat/completions` endpoint with streaming capabilities
+4. **Models Endpoint**: Exposes profiles as models via the `/v1/models` endpoint
 
 ## Background Server Operation
 
@@ -126,6 +142,8 @@ Default settings:
 - `temp`: 0.8 (temperature)
 - `flash_attn`: True (enables Flash Attention)
 - `continuous_batching`: True (enables continuous batching)
+- `api_host`: 0.0.0.0 (API server listen address)
+- `api_port`: 8000 (API server port)
 
 You can customize these and many other options through the interactive menu.
 
@@ -138,6 +156,7 @@ You can customize these and many other options through the interactive menu.
 - Instant, seamless configuration changes
 - Config file managed automatically
 - Automatic server process management
+- OpenAI-compatible API interface
 - Simple single-file deployment
 
 ## Troubleshooting
@@ -145,3 +164,5 @@ You can customize these and many other options through the interactive menu.
 - If the server fails to start, check the error messages for required settings
 - Ensure your model file path is correct
 - Verify that you have sufficient RAM/VRAM for your model size
+- For API issues, check that both the llama-server and API server are running
+- Port conflicts can be resolved by changing the port in the API settings
