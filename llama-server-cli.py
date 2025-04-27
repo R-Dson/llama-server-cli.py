@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -29,11 +30,11 @@ app = typer.Typer(help="LLama Server CLI Tool")
 profile_app = typer.Typer(help="Profile management")
 server_app = typer.Typer(help="Server management")
 config_app = typer.Typer(help="Interactive configuration")
-api_app = typer.Typer(help="API server management")  
+api_app = typer.Typer(help="API server management")
 app.add_typer(profile_app, name="profile")
 app.add_typer(server_app, name="server")
 app.add_typer(config_app, name="config")
-app.add_typer(api_app, name="api") 
+app.add_typer(api_app, name="api")
 
 # Rich console for pretty output
 console = Console()
@@ -126,7 +127,7 @@ class LlamaServerCLI:
         # Create API server
         self.api_server = APIServer(self)
         self.api_thread = None
-        
+
     def _output_reader(self, process, queue, handle_ending=True):
         """Common output reading function for process streams"""
         try:
@@ -342,29 +343,38 @@ class LlamaServerCLI:
         # Get the profile settings
         profiles = self.config.get("profiles", {})
         profile = profiles.get(profile_name, {})
-        
+
         # First try profile-specific setting
         if key in profile:
             return profile[key]
-        
+
         # Then try global setting
         if key in self.config:
             return self.config[key]
-            
+
         # Finally fallback to provided default
         return default
-        
+
     def get_active_settings(self, profile_name: Optional[str] = None) -> Dict:
-        """Get active settings by combining defaults with profile settings"""
+        """Get active settings with proper precedence: profile > global > defaults"""
         if profile_name is None:
             profile_name = self.config.get("active_profile", "default")
 
-        # Start with all global settings except profiles
-        settings = {k: v for k, v in self.config.items() if k != "profiles" and k != "active_profile"}
+        # Start with default configuration
+        settings = self.default_config.copy()
 
-        # Add all profile-specific settings that override globals
-        profile = self.config.get("profiles", {}).get(profile_name, {})
-        settings.update(profile)
+        # Apply global configuration over defaults
+        settings.update(
+            {
+                k: v
+                for k, v in self.config.items()
+                if k != "profiles" and k != "active_profile"
+            }
+        )
+
+        # Apply profile-specific settings (highest priority)
+        profile_settings = self.config.get("profiles", {}).get(profile_name, {})
+        settings.update(profile_settings)
 
         return settings
 
@@ -376,7 +386,9 @@ class LlamaServerCLI:
 
         # Model is required
         if not settings.get("model"):
-            self._handle_error("building args", "No model specified in configuration", True)
+            self._handle_error(
+                "building args", "No model specified in configuration", True
+            )
             return []
 
         args.extend(["-m", settings["model"]])
@@ -420,10 +432,43 @@ class LlamaServerCLI:
         for key, arg in bool_flags.items():
             if settings.get(key, False):
                 args.append(arg)
-                
+
         # Special case for no_continuous_batching (inverse of continuous_batching)
         if settings.get("continuous_batching") is False:
             args.append("--no-cont-batching")
+
+        # Handle custom parameters not defined in the predefined lists
+        predefined_keys = (
+            list(value_args.keys())
+            + list(bool_flags.keys())
+            + [
+                "model",
+                "continuous_batching",
+                "profiles",
+                "active_profile",
+                "api_host",
+                "api_port",
+                "no-perf",
+            ]
+        )
+
+        # Process any custom parameters
+        for key, value in settings.items():
+            if key not in predefined_keys and value is not None:
+                # Check if the key already has dashes
+                if "-" in key:
+                    cmd_key = f"--{key}"
+                else:
+                    # Convert snake_case to command line format with dashes
+                    cmd_key = f"--{key.replace('_', '-')}"
+
+                # Handle boolean values specially
+                if isinstance(value, bool):
+                    if value:  # Only add the flag if True
+                        args.append(cmd_key)
+                else:
+                    # For non-boolean values, add as key-value pair
+                    args.extend([cmd_key, str(value)])
 
         return args
 
@@ -508,7 +553,9 @@ class LlamaServerCLI:
             # In background mode, start a thread to read output and put it in the queue
             if background and output_queue:
                 reader_thread = threading.Thread(
-                    target=lambda: self._output_reader(self.llama_server_process, output_queue)
+                    target=lambda: self._output_reader(
+                        self.llama_server_process, output_queue
+                    )
                 )
                 reader_thread.daemon = (
                     True  # Make thread daemon so it doesn't block program exit
@@ -645,36 +692,44 @@ class LlamaServerCLI:
 
                 elif choice == "Edit current profile settings":
                     self._interactive_edit_profile(active_profile)
-                    
+
                 elif choice == "Edit API server settings":
                     # Add API server configuration
                     api_host = questionary.text(
-                        "API Server Host:", default=str(self.config.get("api_host", "0.0.0.0"))
+                        "API Server Host:",
+                        default=str(self.config.get("api_host", "0.0.0.0")),
                     ).ask()
-                    
+
                     api_port = questionary.text(
-                        "API Server Port:", default=str(self.config.get("api_port", 8000))
+                        "API Server Port:",
+                        default=str(self.config.get("api_port", 8000)),
                     ).ask()
-                    
+
                     try:
                         api_port = int(api_port)
                         self.config["api_host"] = api_host
                         self.config["api_port"] = api_port
                         self.save_config()
                         console.print("[green]API server settings updated[/green]")
-                        
+
                         # Update API server settings if it's running
                         if self.api_server.running:
-                            restart = questionary.confirm("Restart API server with new settings?").ask()
+                            restart = questionary.confirm(
+                                "Restart API server with new settings?"
+                            ).ask()
                             if restart:
                                 self.api_server.stop()
                                 # Update the server object with new settings
                                 self.api_server.host = api_host
                                 self.api_server.port = api_port
                                 self.api_server.start()
-                                console.print("[green]API server restarted with new settings[/green]")
+                                console.print(
+                                    "[green]API server restarted with new settings[/green]"
+                                )
                     except ValueError:
-                        self._handle_error("updating API settings", "Port must be a number", True)
+                        self._handle_error(
+                            "updating API settings", "Port must be a number", True
+                        )
                     time.sleep(1)
 
                 elif choice == "Create new profile":
@@ -966,7 +1021,9 @@ class LlamaServerCLI:
 
                 # Set up background output reader
                 reader_thread = threading.Thread(
-                    target=lambda: self._output_reader(self.llama_server_process, bg_queue, False)
+                    target=lambda: self._output_reader(
+                        self.llama_server_process, bg_queue, False
+                    )
                 )
                 reader_thread.daemon = True
                 reader_thread.start()
@@ -987,7 +1044,9 @@ class APIServer:
         self.running = False
         # Use values from configuration or fallback to defaults
         self.host = self.cli.config.get("api_host", "0.0.0.0")
-        self.port = self.cli.config.get("api_port", 8000)  # Default to port 8000 if not specified
+        self.port = self.cli.config.get(
+            "api_port", 8000
+        )  # Default to port 8000 if not specified
         self.lock = threading.Lock()  # Add a lock for model switching
         self.timeout = 30  # Timeout for server requests
 
@@ -1000,6 +1059,18 @@ class APIServer:
             "/v1/chat/completions", self.create_chat_completion, methods=["POST"]
         )
         self.app.include_router(self.router)
+        
+        # Add client disconnect middleware
+        @self.app.middleware("http")
+        async def handle_client_disconnect(request, call_next):
+            try:
+                return await call_next(request)
+            except (ConnectionResetError, BrokenPipeError, socket.error) as e:
+                console.print(f"[yellow]Client disconnected during request: {str(e)}[/yellow]")
+                # Return a special response for client disconnects
+                # Note: This might not reach the client as they've already disconnected
+                from fastapi.responses import Response
+                return Response(status_code=499, content="Client Disconnected")
 
         self.app.add_middleware(
             CORSMiddleware,
@@ -1147,14 +1218,46 @@ class APIServer:
                                 if line:
                                     # Send each line as-is
                                     yield line + b"\n"
+                        except (BrokenPipeError, ConnectionResetError) as e:
+                            # These are expected when client disconnects
+                            console.print(
+                                f"[yellow]Client disconnected during streaming: {str(e)}[/yellow]"
+                            )
+                            console.print("Terminating stream gracefully.")
+                            # No need to yield anything here as the client is gone
+                            return
+                        except socket.error as e:
+                            console.print(
+                                f"[yellow]Socket error during streaming: {str(e)}[/yellow]"
+                            )
+                            console.print(
+                                "Client likely disconnected. Terminating stream gracefully."
+                            )
+                            # No need to yield anything here as the client is gone
+                            return
                         except Exception as e:
                             console.print(
                                 f"[red]Error during streaming: {str(e)}[/red]"
                             )
-                            yield f'data: {{"error": "{str(e)}"}}\n\n'.encode("utf-8")
+                            # Log additional info for debugging
+                            console.print(
+                                "[yellow]Client likely disconnected. Terminating stream gracefully.[/yellow]"
+                            )
+                            # Send a final message indicating the stream was interrupted
+                            yield f'data: {{"error": "Stream interrupted: {str(e).replace("'", "\\'")}", "finish_reason": "client_disconnected"}}\n\n'.encode(
+                                "utf-8"
+                            )
 
                     return StreamingResponse(
-                        stream_generator(), media_type="text/event-stream"
+                        stream_generator(), 
+                        media_type="text/event-stream",
+                        status_code=200,
+                        # Set headers to disable caching for streaming response
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",  # Disable buffering in Nginx
+                        }
                     )
 
                 # For non-streaming, return the JSON response
@@ -1168,6 +1271,11 @@ class APIServer:
             except requests.exceptions.RequestException as e:
                 console.print(f"[red]Request error: {str(e)}[/red]")
                 raise HTTPException(500, f"Error forwarding request: {str(e)}")
+            except (BrokenPipeError, ConnectionResetError, socket.error) as e:
+                console.print(f"[yellow]Client connection error: {str(e)}[/yellow]")
+                console.print("Client likely disconnected during the request.")
+                # For API consistency, still raise an exception
+                raise HTTPException(499, "Client Closed Request")
             except Exception as e:
                 console.print(f"[red]Unexpected error: {str(e)}[/red]")
                 raise HTTPException(500, f"Unexpected error: {str(e)}")
@@ -1183,7 +1291,9 @@ class APIServer:
                     not self.cli.llama_server_process
                     or self.cli.llama_server_process.poll() is not None
                 ):
-                    self.cli._handle_error("waiting for server", "Server process has stopped", True)
+                    self.cli._handle_error(
+                        "waiting for server", "Server process has stopped", True
+                    )
                     return False
 
                 # Try a basic health check first
@@ -1228,6 +1338,8 @@ class APIServer:
                     port=self.port,
                     log_level="info",
                     access_log=True,  # Enable access logs
+                    timeout_keep_alive=5,  # Reduce keep-alive timeout
+                    timeout_graceful_shutdown=10,  # Grace period for shutdown
                 )
             )
             self.thread = Thread(target=self._run_server)
@@ -1241,9 +1353,19 @@ class APIServer:
             self.server.run()
         except OSError as e:
             if "address already in use" in str(e):
-                self.cli._handle_error(f"starting API server", f"Port {self.port} already in use!", True)
+                self.cli._handle_error(
+                    "starting API server", f"Port {self.port} already in use!", True
+                )
             else:
                 self.cli._handle_error("running API server", e, True)
+        except (BrokenPipeError, ConnectionResetError, socket.error) as e:
+            # These are expected when client disconnects abruptly
+            self.cli.console.print(f"[yellow]Client connection error in server: {str(e)}[/yellow]")
+            self.cli.console.print("This is likely due to a client disconnection and is not a serious issue.")
+            # Don't report this as an error - just log it
+            if self.running:
+                # Try to keep the server running if possible
+                self.cli.console.print("[yellow]Attempting to continue server operation...[/yellow]")
         except Exception as e:
             self.cli._handle_error("running API server", e, True)
         finally:
