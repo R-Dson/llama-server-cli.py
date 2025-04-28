@@ -1,6 +1,18 @@
 # Llama Server CLI
 
-A simple, user-friendly CLI tool for managing, and running, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) with multiple configuration profiles and providing OpenAI-compatible API access.
+
+### A simple, user-friendly CLI tool for managing, and running, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) with multiple configuration profiles and providing OpenAI-compatible API access.
+
+<details>
+<summary>
+
+## Image of the interactive interface
+
+</summary>
+
+![interface](./assets/interface.png)
+
+</details>
 
 ## Key Features
 *   **Simple Single-File Deployment** - easy to deploy and get started.
