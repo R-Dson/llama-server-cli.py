@@ -1059,17 +1059,20 @@ class APIServer:
             "/v1/chat/completions", self.create_chat_completion, methods=["POST"]
         )
         self.app.include_router(self.router)
-        
+
         # Add client disconnect middleware
         @self.app.middleware("http")
         async def handle_client_disconnect(request, call_next):
             try:
                 return await call_next(request)
             except (ConnectionResetError, BrokenPipeError, socket.error) as e:
-                console.print(f"[yellow]Client disconnected during request: {str(e)}[/yellow]")
+                console.print(
+                    f"[yellow]Client disconnected during request: {str(e)}[/yellow]"
+                )
                 # Return a special response for client disconnects
                 # Note: This might not reach the client as they've already disconnected
                 from fastapi.responses import Response
+
                 return Response(status_code=499, content="Client Disconnected")
 
         self.app.add_middleware(
@@ -1175,6 +1178,10 @@ class APIServer:
             )
 
             try:
+                # Start timing for usage metrics
+                start_time = time.time()
+                load_start_time = start_time
+
                 # For streaming requests, use stream=True
                 is_streaming = request.get("stream", False)
                 response = requests.post(
@@ -1189,6 +1196,9 @@ class APIServer:
                     timeout=self.timeout,
                     stream=is_streaming,
                 )
+
+                # Record load time (time to first response)
+                load_duration = time.time() - load_start_time
 
                 # Check for error response
                 if response.status_code != 200:
@@ -1211,13 +1221,97 @@ class APIServer:
 
                 # For streaming responses, return a StreamingResponse
                 if is_streaming:
+                    # Initialize tracking variables
+                    has_usage = False
+                    has_timings = False
+                    final_chunk = None
 
                     async def stream_generator():
+                        nonlocal has_usage, has_timings, final_chunk
+
                         try:
                             for line in response.iter_lines():
                                 if line:
+                                    # Store the data for analysis
+                                    if line.startswith(b"data: "):
+                                        json_str = line[6:].decode("utf-8")
+                                        if json_str.strip() and json_str != "[DONE]":
+                                            try:
+                                                chunk_data = json.loads(json_str)
+                                                # Keep track of the final non-[DONE] chunk
+                                                final_chunk = chunk_data
+                                                # Check if it contains usage or timings
+                                                if "usage" in chunk_data:
+                                                    has_usage = True
+                                                if "timings" in chunk_data:
+                                                    has_timings = True
+                                            except Exception:
+                                                pass  # Ignore parsing errors, just pass through
+
                                     # Send each line as-is
                                     yield line + b"\n"
+
+                            # Send a final message with usage statistics
+                            total_duration = time.time() - start_time
+
+                            # Create info using available data
+                            info = {}
+
+                            # From final chunk if available
+                            if final_chunk:
+                                if has_usage and "usage" in final_chunk:
+                                    info.update(
+                                        {
+                                            "prompt_tokens": final_chunk["usage"].get(
+                                                "prompt_tokens", 0
+                                            ),
+                                            "completion_tokens": final_chunk[
+                                                "usage"
+                                            ].get("completion_tokens", 0),
+                                            "total_tokens": final_chunk["usage"].get(
+                                                "total_tokens", 0
+                                            ),
+                                        }
+                                    )
+
+                                if has_timings and "timings" in final_chunk:
+                                    timings = final_chunk["timings"]
+                                    info.update(
+                                        {
+                                            "prompt_eval_count": timings.get(
+                                                "prompt_n", 0
+                                            ),
+                                            "prompt_eval_duration": round(
+                                                timings.get("prompt_ms", 0) / 1000, 2
+                                            ),
+                                            "eval_count": timings.get("predicted_n", 0),
+                                            "eval_duration": round(
+                                                timings.get("predicted_ms", 0) / 1000, 2
+                                            ),
+                                            "tokens_per_second": round(
+                                                timings.get("predicted_per_second", 0),
+                                                2,
+                                            ),
+                                        }
+                                    )
+
+                            # Add timing information we tracked
+                            info.update(
+                                {
+                                    "total_duration": round(total_duration, 2),
+                                    "load_duration": round(load_duration, 2),
+                                }
+                            )
+
+                            # Send a final data message with usage info
+                            final_message = json.dumps({"usage": info})
+                            yield f"data: {final_message}\n\n".encode("utf-8")
+                            yield b"data: [DONE]\n\n"
+
+                            # console.print(
+                            #     f"[green]Stream completed. Usage info: {json.dumps(info, indent=2)}[/green]"
+                            # )
+
                         except (BrokenPipeError, ConnectionResetError) as e:
                             # These are expected when client disconnects
                             console.print(
@@ -1249,7 +1343,7 @@ class APIServer:
                             )
 
                     return StreamingResponse(
-                        stream_generator(), 
+                        stream_generator(),
                         media_type="text/event-stream",
                         status_code=200,
                         # Set headers to disable caching for streaming response
@@ -1257,11 +1351,69 @@ class APIServer:
                             "Cache-Control": "no-cache",
                             "Connection": "keep-alive",
                             "X-Accel-Buffering": "no",  # Disable buffering in Nginx
+                        },
+                    )
+
+                # For non-streaming, use server-provided metrics
+                response_json = response.json()
+                total_duration = time.time() - start_time
+
+                # Create info field for client expected format
+                info = {}
+
+                # Copy existing usage data if available
+                if "usage" in response_json:
+                    info.update(
+                        {
+                            "prompt_tokens": response_json["usage"].get(
+                                "prompt_tokens", 0
+                            ),
+                            "completion_tokens": response_json["usage"].get(
+                                "completion_tokens", 0
+                            ),
+                            "total_tokens": response_json["usage"].get(
+                                "total_tokens", 0
+                            ),
                         }
                     )
 
-                # For non-streaming, return the JSON response
-                return response.json()
+                # Copy timings data if available
+                if "timings" in response_json:
+                    timings = response_json["timings"]
+                    # Convert milliseconds to seconds where needed
+                    info.update(
+                        {
+                            "prompt_eval_count": timings.get("prompt_n", 0),
+                            "prompt_eval_duration": round(
+                                timings.get("prompt_ms", 0) / 1000, 2
+                            ),
+                            "eval_count": timings.get("predicted_n", 0),
+                            "eval_duration": round(
+                                timings.get("predicted_ms", 0) / 1000, 2
+                            ),
+                            "tokens_per_second": round(
+                                timings.get("predicted_per_second", 0), 2
+                            ),
+                        }
+                    )
+
+                # Add total timing information
+                info.update(
+                    {
+                        "total_duration": round(total_duration, 2),
+                        "load_duration": round(load_duration, 2),
+                    }
+                )
+
+                # Update usage field with collected info
+                if "usage" not in response_json:
+                    response_json["usage"] = {}
+                response_json["usage"].update(info)
+
+                console.print(
+                    f"[green]Request completed. Usage info: {json.dumps(info, indent=2)}[/green]"
+                )
+                return response_json
 
             except requests.exceptions.ConnectionError as e:
                 console.print(f"[red]Connection error: {str(e)}[/red]")
@@ -1360,12 +1512,18 @@ class APIServer:
                 self.cli._handle_error("running API server", e, True)
         except (BrokenPipeError, ConnectionResetError, socket.error) as e:
             # These are expected when client disconnects abruptly
-            self.cli.console.print(f"[yellow]Client connection error in server: {str(e)}[/yellow]")
-            self.cli.console.print("This is likely due to a client disconnection and is not a serious issue.")
+            self.cli.console.print(
+                f"[yellow]Client connection error in server: {str(e)}[/yellow]"
+            )
+            self.cli.console.print(
+                "This is likely due to a client disconnection and is not a serious issue."
+            )
             # Don't report this as an error - just log it
             if self.running:
                 # Try to keep the server running if possible
-                self.cli.console.print("[yellow]Attempting to continue server operation...[/yellow]")
+                self.cli.console.print(
+                    "[yellow]Attempting to continue server operation...[/yellow]"
+                )
         except Exception as e:
             self.cli._handle_error("running API server", e, True)
         finally:
