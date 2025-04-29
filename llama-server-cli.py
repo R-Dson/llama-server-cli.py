@@ -97,8 +97,14 @@ class LlamaServerCLI:
     def __init__(self):
         self.console = console
         self.config_path = "config.json"
+        
+        # Server state
         self.llama_server_process = None
-        # Define default_config before using it in load_config
+        self.last_activity_timestamp = time.time()
+        self.can_kill = True
+        self.inactivity_monitor_thread = None
+        
+        # Default configuration
         self.default_config = {
             "model": None,
             "ctx_size": 2048,
@@ -122,21 +128,13 @@ class LlamaServerCLI:
             "server_ready_timeout": 60,
             "profiles": {"default": {}},
         }
-        # Now load config which may use default_config
+        
+        # Load configuration
         self.config = self.load_config()
-        # Create server monitor
+        
+        # Create server components
         self.server_monitor = ServerMonitor(self)
-        # Create API server
         self.api_server = APIServer(self)
-        self.api_thread = None
-        # Thread-safe flag to control whether the inactivity timer can kill the server
-        self.can_kill = True
-        self.can_kill_lock = threading.Lock()
-        # Last activity timestamp
-        self.last_activity_timestamp = time.time()
-        self.last_activity_lock = threading.Lock()
-        # Inactivity monitor thread
-        self.inactivity_monitor_thread = None
 
     def _output_reader(self, process, queue, handle_ending=True):
         """Common output reading function for process streams"""
@@ -608,99 +606,75 @@ class LlamaServerCLI:
 
     def stop_server(self) -> None:
         """Stop the running llama-server"""
-        if self.llama_server_process and self.llama_server_process.poll() is None:
-            console.print("[yellow]Stopping llama-server...[/yellow]")
+        if not self.llama_server_process or self.llama_server_process.poll() is not None:
+            # Try to find and terminate any orphaned processes
+            self._terminate_orphaned_processes()
+            console.print("[yellow]No running server to stop[/yellow]")
+            return
+            
+        console.print("[yellow]Stopping llama-server...[/yellow]")
+        try:
+            # First try graceful termination
+            self.llama_server_process.terminate()
+            
+            # Wait up to 10 seconds for graceful termination
             try:
-                self.llama_server_process.terminate()
-                # Wait up to 10 seconds for graceful termination
+                self.llama_server_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                console.print("[red]Server not responding, forcing kill...[/red]")
+                self.llama_server_process.kill()
                 try:
-                    self.llama_server_process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    console.print("[red]Server not responding, forcing kill...[/red]")
-                    self.llama_server_process.kill()
-                    try:
-                        self.llama_server_process.wait(timeout=2)
-                    except:
-                        pass
-            except Exception as e:
-                console.print(f"[red]Error stopping server: {e}[/red]")
-
-            # Ensure server is really stopped by checking for any remaining processes
-            self.ensure_server_shutdown()
+                    self.llama_server_process.wait(timeout=2)
+                except:
+                    pass
+                    
+            # Final check for orphaned processes
+            self._terminate_orphaned_processes()
             
             self.llama_server_process = None
             console.print("[green]Server stopped[/green]")
-        else:
-            # Even if process reference is missing, try to make sure no servers are running
-            self.ensure_server_shutdown()
-            console.print("[yellow]No running server to stop[/yellow]")
             
-    def ensure_server_shutdown(self) -> None:
-        """Ensure all llama-server processes are terminated
-        
-        This is a safety measure to handle cases where the process reference
-        is lost but the actual process is still running.
-        """
+        except Exception as e:
+            console.print(f"[red]Error stopping server: {e}[/red]")
+            # Still try to terminate orphaned processes
+            self._terminate_orphaned_processes()
+    
+    def _terminate_orphaned_processes(self) -> None:
+        """Find and terminate any orphaned llama-server processes"""
         try:
-            # Try to find and kill any remaining llama-server processes
             if os.name == 'posix':  # Linux/Mac
-                # First check if there are any processes matching the specific executable
+                # Check for any processes matching the pattern
                 check_result = subprocess.run(
-                    ["pgrep", "-f", r"\./llama-server"], # More specific pattern
+                    ["pgrep", "-f", r"\./llama-server"],
                     capture_output=True,
                     text=True
                 )
                 
-                # If we found processes, try to kill them
                 if check_result.returncode == 0 and check_result.stdout.strip():
-                    pids = check_result.stdout.strip().split('\\n')
-                    console.print(f"[yellow]Found {len(pids)} \\'./llama-server\\' processes still running. Terminating...[/yellow]")
+                    console.print("[yellow]Found orphaned llama-server processes. Terminating...[/yellow]")
                     
-                    # Try gentle SIGTERM first with specific pattern
-                    kill_result = subprocess.run(
-                        ["pkill", "-TERM", "-f", r"\./llama-server"], # More specific pattern
-                        capture_output=True
-                    )
-                    
-                    # Wait a bit for processes to terminate
+                    # Try SIGTERM first
+                    subprocess.run(["pkill", "-TERM", "-f", r"\./llama-server"], capture_output=True)
                     time.sleep(2)
                     
-                    # Check if anything is still running and use SIGKILL if needed
-                    check_again = subprocess.run(
-                        ["pgrep", "-f", r"\./llama-server"], # More specific pattern
-                        capture_output=True
-                    )
-                    
+                    # Force kill any remaining processes
+                    check_again = subprocess.run(["pgrep", "-f", r"\./llama-server"], capture_output=True)
                     if check_again.returncode == 0:
-                        console.print("[red]Some processes still running, forcing kill...[/red]")
-                        subprocess.run(
-                            ["pkill", "-KILL", "-f", r"\./llama-server"], # More specific pattern
-                            capture_output=True
-                        )
+                        subprocess.run(["pkill", "-KILL", "-f", r"\./llama-server"], capture_output=True)
                         
-                    console.print("[green]All \\'./llama-server\\' processes terminated[/green]")
-            
             elif os.name == 'nt':  # Windows
-                # Check for running llama-server.exe processes
                 check_result = subprocess.run(
-                    # Target specific executable
-                    ["tasklist", "/fi", "imagename eq llama-server.exe"], 
+                    ["tasklist", "/fi", "imagename eq llama-server.exe"],
                     capture_output=True,
                     text=True
                 )
                 
-                # Check if the executable name is in the output
                 if "llama-server.exe" in check_result.stdout:
-                    console.print("[yellow]Found llama-server.exe processes still running. Terminating...[/yellow]")
-                    subprocess.run(
-                        # Target specific executable
-                        ["taskkill", "/IM", "llama-server.exe", "/F"],
-                        capture_output=True
-                    )
-                    console.print("[green]All llama-server.exe processes terminated[/green]")
-        
+                    console.print("[yellow]Found orphaned llama-server.exe processes. Terminating...[/yellow]")
+                    subprocess.run(["taskkill", "/IM", "llama-server.exe", "/F"], capture_output=True)
+                    
         except Exception as e:
-            console.print(f"[red]Error ensuring server shutdown: {e}[/red]")
+            console.print(f"[red]Error terminating orphaned processes: {e}[/red]")
 
     def interactive_config(self) -> None:
         """Interactive configuration mode"""
@@ -960,14 +934,15 @@ class LlamaServerCLI:
                 # Show current profile settings
                 self.show_profile(profile_name)
 
-                # Build settings menu
+                # Get settings data
                 profile_settings = self.config.get("profiles", {}).get(profile_name, {})
                 all_settings = self.get_active_settings(profile_name)
 
-                # Common settings to configure
+                # Common settings to configure (ordered by importance)
                 common_settings = [
                     "model",
-                    "ctx_size",
+                    "ctx_size", 
+                    "n_gpu_layers",
                     "threads",
                     "temp",
                     "top_k",
@@ -975,212 +950,130 @@ class LlamaServerCLI:
                     "batch_size",
                     "host",
                     "port",
-                    "n_gpu_layers",
-                    "inactivity_timeout",
                     "flash_attn",
                     "mlock",
                     "no_mmap",
                     "continuous_batching",
+                    "inactivity_timeout",
                 ]
 
-                # Add existing settings that might not be in common_settings
+                # Add any existing custom settings
                 for key in profile_settings:
-                    if (
-                        key not in common_settings
-                        and key != "profiles"
-                        and key != "active_profile"
-                    ):
+                    if key not in common_settings and key not in ["profiles", "active_profile"]:
                         common_settings.append(key)
 
-                # Menu options
+                # Build menu options
                 choices = [
                     f"Set {key} (current: {all_settings.get(key, 'Not set')})"
                     for key in common_settings
                 ] + ["Add custom setting", "Clear a setting", "Back to main menu"]
 
+                # Show menu
                 choice = numbered_choice("Choose setting to edit:", choices)
-
-                if not choice:  # Handle None return (Ctrl+C or similar)
+                if not choice:
                     break
 
+                # Handle menu selection
                 if choice == "Back to main menu":
                     break
+                    
                 elif choice == "Add custom setting":
                     key = questionary.text("Enter setting name:").ask()
                     if key and key.strip():
                         value = questionary.text(f"Enter value for {key}:").ask()
-                        if value is not None:  # Allow empty string
+                        if value is not None:
                             self.set_setting(profile_name, key.strip(), value)
-                            time.sleep(1)
+                            
                 elif choice == "Clear a setting":
                     if not profile_settings:
-                        console.print(
-                            "[yellow]No settings to clear in this profile.[/yellow]"
-                        )
+                        console.print("[yellow]No settings to clear in this profile.[/yellow]")
                         time.sleep(1)
                         continue
-                    choices_list = list(profile_settings.keys())
-                    choices_list.append("Back to settings menu")
-                    setting_to_clear = numbered_choice(
-                        "Select setting to clear:", choices_list
-                    )
-
-                    if setting_to_clear:
+                        
+                    clear_choices = list(profile_settings.keys()) + ["Back to settings menu"]
+                    setting_to_clear = numbered_choice("Select setting to clear:", clear_choices)
+                    if setting_to_clear and setting_to_clear != "Back to settings menu":
                         self.clear_setting(profile_name, setting_to_clear)
-                        time.sleep(1)
+                        
                 else:
-                    # Extract the setting name from the choice string
+                    # Extract setting name from choice
                     setting = choice.split(" ")[1]
-
-                    # Get appropriate input based on setting type
+                    
+                    # Handle model selection specially
                     if setting == "model":
-                        # Find available models
                         models = find_gguf_models()
-
-                        if not models:
-                            console.print(
-                                "[yellow]No GGUF models found in the gguf directory or current directory.[/yellow]"
-                            )
-                            console.print(
-                                "[yellow]Please place your models in the gguf directory and try again.[/yellow]"
-                            )
-                            console.print(
-                                "[yellow]Alternatively, you can enter a custom path:[/yellow]"
-                            )
-                            value = questionary.text(
-                                "Enter path to model file:",
-                                default=str(all_settings.get(setting, "")),
-                            ).ask()
-                        else:
-                            # Add option for manual entry
+                        if models:
                             models.append("Enter custom path manually")
-
-                            # Show model selection menu
-                            console.print("[green]Available models:[/green]")
-                            selected_model = numbered_choice(
-                                "Select a model to use:", models
-                            )
-
+                            selected_model = numbered_choice("Select a model to use:", models)
+                            
                             if selected_model == "Enter custom path manually":
                                 value = questionary.text(
                                     "Enter path to model file:",
-                                    default=str(all_settings.get(setting, "")),
+                                    default=str(all_settings.get(setting, ""))
                                 ).ask()
                             else:
                                 value = selected_model
+                        else:
+                            console.print("[yellow]No GGUF models found. Enter path manually:[/yellow]")
+                            value = questionary.text(
+                                "Enter path to model file:",
+                                default=str(all_settings.get(setting, ""))
+                            ).ask()
+                            
+                    # Handle different setting types appropriately
                     elif setting in ["temp", "top_p"]:
                         value = questionary.text(
                             f"Enter value for {setting} (0.0-1.0):",
-                            default=str(all_settings.get(setting, "")),
+                            default=str(all_settings.get(setting, ""))
                         ).ask()
-                    elif setting in [
-                        "ctx_size",
-                        "threads",
-                        "top_k",
-                        "batch_size",
-                        "port",
-                        "n_gpu_layers",
-                        "inactivity_timeout",
-                    ]:
+                    elif setting in ["ctx_size", "threads", "top_k", "batch_size", "port", "n_gpu_layers", "inactivity_timeout"]:
                         value = questionary.text(
-                            f"Enter value for {setting} (number, 0 to disable):",  # Update prompt slightly
-                            default=str(all_settings.get(setting, "")),
+                            f"Enter value for {setting} (number):",
+                            default=str(all_settings.get(setting, ""))
                         ).ask()
-                    elif setting in [
-                        "ignore_eos",
-                        "no_mmap",
-                        "mlock",
-                        "embedding",
-                        "flash_attn",
-                        "continuous_batching",
-                    ]:
+                    elif setting in ["flash_attn", "no_mmap", "mlock", "continuous_batching"]:
                         value = questionary.confirm(
                             f"Enable {setting}?",
-                            default=bool(all_settings.get(setting, False)),
+                            default=bool(all_settings.get(setting, False))
                         ).ask()
                     else:
                         value = questionary.text(
                             f"Enter value for {setting}:",
-                            default=str(all_settings.get(setting, "")),
+                            default=str(all_settings.get(setting, ""))
                         ).ask()
-
-                    if value is not None:  # Allow empty string and False
+                        
+                    # Apply the setting if we got a value
+                    if value is not None:
                         self.set_setting(profile_name, setting, value)
-                        time.sleep(0.5)
+                        
+                # Brief pause to show feedback
+                time.sleep(0.5)
+                
         except KeyboardInterrupt:
-            # Return to previous menu on Ctrl+C
-            pass
+            pass  # Return to previous menu on Ctrl+C
 
     def restart_server_seamless(self, profile_name: str) -> None:
-        """Restart the server seamlessly in the background without visible messages or delays"""
-        if self.llama_server_process and self.llama_server_process.poll() is None:
-            # Stop current server silently
-            self.llama_server_process.terminate()
-            try:
-                self.llama_server_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.llama_server_process.kill()
-                self.llama_server_process.wait()
-
-            # Start new server silently
-            bg_queue = queue.Queue()
-            args = self.build_llama_args(profile_name)
-            if not args:
-                return False
-
-            try:
-                # Start new process
-                self.llama_server_process = subprocess.Popen(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True,
-                )
-
-                # Set up background output reader
-                reader_thread = threading.Thread(
-                    target=lambda: self._output_reader(
-                        self.llama_server_process, bg_queue, False
-                    )
-                )
-                reader_thread.daemon = True
-                reader_thread.start()
-
-                # Reset activity timestamp and can_kill flag
-                with self.last_activity_lock:
-                    self.last_activity_timestamp = time.time()
-                with self.can_kill_lock:
-                    self.can_kill = False
-
-                # Restart inactivity monitor
-                self.start_inactivity_monitor()
-
-                return True
-            except Exception:
-                return False
-        return False
+        """Restart the server seamlessly in the background"""
+        if not self.llama_server_process or self.llama_server_process.poll() is not None:
+            return False
+        
+        # Stop the current server
+        self.stop_server()
+        
+        # Start new server in background
+        bg_queue = queue.Queue()
+        success = self.start_server(profile_name, background=True, output_queue=bg_queue)
+        
+        # Reset activity state
+        self.last_activity_timestamp = time.time()
+        self.can_kill = False
+        
+        return success
 
     def start_inactivity_monitor(self):
-        """Start the inactivity monitor thread if not already running
-        
-        This starts a background thread that monitors server activity and automatically
-        shuts down the llama-server process after a period of inactivity (defined by
-        inactivity_timeout in the config).
-        
-        The monitor uses a thread-safe 'can_kill' flag to determine if it's allowed to
-        stop the server. This flag is set to False whenever an API request is being
-        processed, and set to True when all requests are complete.
-        
-        The monitor will:
-        1. Only kill the server if can_kill=True and inactivity_timeout has elapsed
-        2. Reset its timer if activity occurs or can_kill=False when timeout is reached
-        3. Exit automatically if the server process is no longer running
-        """
-        # Update the activity timestamp when starting the monitor
-        with self.last_activity_lock:
-            self.last_activity_timestamp = time.time()
+        """Start the inactivity monitor thread if not already running"""
+        # Reset activity timestamp
+        self.last_activity_timestamp = time.time()
         
         # Only start if not already running
         if self.inactivity_monitor_thread is None or not self.inactivity_monitor_thread.is_alive():
@@ -1189,203 +1082,52 @@ class LlamaServerCLI:
             )
             self.inactivity_monitor_thread.daemon = True
             self.inactivity_monitor_thread.start()
-            self.console.print("[dim]Inactivity monitor started[/dim]")
     
     def update_activity_timestamp(self):
-        """Update the last activity timestamp to prevent server shutdown
-        
-        This method should be called whenever there is activity on the server 
-        (such as an API request being processed). It performs two functions:
-        
-        1. Updates the last_activity_timestamp to the current time
-        2. Sets can_kill to False to prevent the inactivity monitor from 
-           shutting down the server during ongoing operations
-           
-        The can_kill flag will be set back to True when all API requests 
-        are completed.
-        """
-        with self.last_activity_lock:
-            self.last_activity_timestamp = time.time()
-            # When activity occurs, we should NOT kill the server
-            with self.can_kill_lock:
-                self.can_kill = False
+        """Update the last activity timestamp to prevent server shutdown"""
+        self.last_activity_timestamp = time.time()
+        self.can_kill = False
     
     def _inactivity_monitor_loop(self):
-        """Monitor inactivity and shut down server when idle for too long
-        
-        This is the main loop for the inactivity monitor thread. It:
-        
-        1. Checks if the server is running
-        2. Calculates the time since the last activity
-        3. Checks the thread-safe can_kill flag 
-        4. If both the inactivity_timeout has elapsed AND can_kill is True,
-           it shuts down the server to save resources
-        5. If inactivity_timeout has elapsed but can_kill is False (indicating
-           server is still in use), it resets the timer
-        6. Loops every 10 seconds until the server is stopped
-        
-        This logic ensures the server is only shut down when truly idle,
-        preserving the user experience while saving resources.
-        """
-        # Print a startup message to diagnose monitor issues
-        self.console.print(f"[dim]Inactivity monitor started for {self.config.get('active_profile', 'default')} profile[/dim]")
-        
-        # Store the process ID at the start for better tracking
-        server_pid = None
-        if self.llama_server_process:
-            try:
-                server_pid = self.llama_server_process.pid
-                self.console.print(f"[dim]Monitoring llama-server process PID: {server_pid}[/dim]")
-            except:
-                pass
-        
+        """Monitor inactivity and shut down server when idle for too long"""
         while True:
             try:
-                # Check if the server is actually running using multiple methods
-                server_running = False
-                
-                # Method 1: Check via the stored process reference
-                process_alive = False
-                if self.llama_server_process and self.llama_server_process.poll() is None:
-                    process_alive = True
-                
-                # Method 2: If we have a PID, try to directly check if that process exists
-                pid_alive = False
-                if server_pid:
-                    try:
-                        # Call os.kill with signal 0 to check if process exists
-                        os.kill(server_pid, 0)
-                        pid_alive = True
-                    except OSError:
-                        pid_alive = False
-                    except:
-                        pass
-                
-                # Method 3: Check if there are any llama-server processes running on the system
-                system_alive = False
-                try:
-                    # Try to find llama-server in running processes
-                    if os.name == 'posix':  # Linux/Mac
-                        check_result = subprocess.run(
-                            ["pgrep", "-f", "llama-server"], 
-                            capture_output=True, 
-                            text=True
-                        )
-                        if check_result.returncode == 0 and check_result.stdout.strip():
-                            system_alive = True
-                    elif os.name == 'nt':  # Windows
-                        check_result = subprocess.run(
-                            ["tasklist", "/fi", "imagename eq llama-server*"], 
-                            capture_output=True, 
-                            text=True
-                        )
-                        if "llama-server" in check_result.stdout:
-                            system_alive = True
-                except:
-                    pass
-                    
-                # Combine all methods - server is running if any method says it's alive
-                server_running = process_alive or pid_alive or system_alive
-                
-                # Debug output for process detection methods
-                if process_alive != pid_alive or process_alive != system_alive:
-                    self.console.print(f"[yellow]Process detection mismatch: process_alive={process_alive}, pid_alive={pid_alive}, system_alive={system_alive}[/yellow]")
-                
-                if server_running:
-                    current_time = time.time()
-                    timeout_seconds = self.config.get("inactivity_timeout", self.default_config["inactivity_timeout"])
-                    
-                    # Check if we're allowed to kill the server
-                    can_kill = False
-                    with self.can_kill_lock:
-                        can_kill = self.can_kill
-                    
-                    # Get the last activity time
-                    last_activity = 0
-                    with self.last_activity_lock:
-                        last_activity = self.last_activity_timestamp
-                    
-                    # Calculate time since last activity
-                    idle_time = current_time - last_activity
-                    
-                    # Check if there are active requests through the API server
-                    active_api_requests = False
-                    if hasattr(self, 'api_server') and self.api_server.running:
-                        with self.api_server.active_requests_lock:
-                            if self.api_server.active_requests > 0:
-                                active_api_requests = True
-                                # self.console.print(f"[dim]Active API requests detected: {self.api_server.active_requests}[/dim]")
-                        with self.api_server.active_streams_lock:
-                            if self.api_server.active_streams > 0:
-                                active_api_requests = True
-                                # self.console.print(f"[dim]Active API streams detected: {self.api_server.active_streams}[/dim]")
-                    
-                    # If we have active API requests, update the timestamp
-                    if active_api_requests:
-                        with self.last_activity_lock:
-                            self.last_activity_timestamp = current_time
-                        # self.console.print("[dim]Active API requests detected, resetting timer[/dim]")
-                        time.sleep(2)
-                        continue
-                    
-                    # Check current status more frequently for debugging
-                    # if idle_time % 60 < 1:
-                    #     self.console.print(f"[dim]Server idle for {int(idle_time)} seconds (timeout: {timeout_seconds}, can_kill: {can_kill})[/dim]")
-                    
-                    # If we've been idle for longer than the timeout and we're allowed to kill
-                    if idle_time >= timeout_seconds and can_kill:
-                        self.console.print(f"[yellow]Server idle for {int(idle_time)} seconds, shutting down...[/yellow]")
-                        self.stop_server()
-                        break
-                    
-                    # If idle time is extremely long (3x the timeout), force a shutdown regardless of can_kill
-                    elif idle_time >= (timeout_seconds * 3):
-                        self.console.print(f"[red]Server idle for {int(idle_time)} seconds (3x timeout)! Forcing shutdown...[/red]")
-                        # Force reset API counters if there are any
-                        if hasattr(self, 'api_server') and self.api_server.running:
-                            self.api_server.reset_counters()
-                        self.stop_server()
-                        break
-                    
-                    # Log periodic status if close to timeout
-                    # elif idle_time >= (timeout_seconds * 0.8) and idle_time % 60 < 1:
-                    #     self.console.print(f"[dim]Server idle for {int(idle_time)} seconds (timeout: {timeout_seconds})[/dim]")
-                else:
-                    # Try to kill the process if any of the detection methods found it alive
-                    if pid_alive or system_alive:
-                        self.console.print(f"[yellow]Process reference lost but server may still be running (PID: {server_pid}). Attempting to terminate...[/yellow]")
-                        try:
-                            # Try to terminate the process if we have the PID
-                            if server_pid:
-                                if os.name == 'posix':  # Linux/Mac
-                                    os.kill(server_pid, signal.SIGTERM)
-                                # elif os.name == 'nt':  # Windows
-                                #     subprocess.run(["taskkill", "/PID", str(server_pid), "/F"], capture_output=True)
-                            
-                            # Fallback - try to kill all llama-server processes
-                            if os.name == 'posix':  # Linux/Mac
-                                subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
-                            # elif os.name == 'nt':  # Windows
-                            #     subprocess.run(["taskkill", "/IM", "llama-server*", "/F"], capture_output=True)
-                                
-                            self.console.print(f"[green]Successfully terminated stray llama-server processes[/green]")
-                        except Exception as kill_err:
-                            self.console.print(f"[red]Error terminating process: {kill_err}[/red]")
-                    
-                    # Server not running, exit the loop
-                    self.console.print(f"[dim]Server process no longer running. Exiting inactivity monitor.[/dim]")
+                # Exit if server is not running
+                if self.llama_server_process is None or self.llama_server_process.poll() is not None:
                     break
+                    
+                # Get configured timeout
+                timeout_seconds = self.config.get("inactivity_timeout", self.default_config["inactivity_timeout"])
+                
+                # Calculate time since last activity
+                idle_time = time.time() - self.last_activity_timestamp
+                
+                # Check if API server has active requests
+                api_is_active = False
+                if hasattr(self, 'api_server') and self.api_server.running:
+                    if self.api_server.active_requests > 0 or self.api_server.active_streams > 0:
+                        api_is_active = True
+                        self.last_activity_timestamp = time.time()
+                
+                # If we've been idle for longer than the timeout and we're allowed to kill
+                if idle_time >= timeout_seconds and self.can_kill and not api_is_active:
+                    console.print(f"[yellow]Server idle for {int(idle_time)} seconds, shutting down...[/yellow]")
+                    self.stop_server()
+                    break
+                
+                # Force shutdown after 3x timeout period regardless of state
+                elif idle_time >= (timeout_seconds * 3):
+                    console.print(f"[red]Server idle for {int(idle_time)} seconds (3x timeout)! Forcing shutdown...[/red]")
+                    if hasattr(self, 'api_server') and self.api_server.running:
+                        self.api_server.reset_counters()
+                    self.stop_server()
+                    break
+                
             except Exception as e:
-                self.console.print(f"[red]Error in inactivity monitor: {e}[/red]")
-                # Print traceback for better debugging
-                import traceback
-                self.console.print(f"[red]{traceback.format_exc()}[/red]")
+                console.print(f"[red]Error in inactivity monitor: {e}[/red]")
             
-            # Sleep for a bit before checking again
-            time.sleep(10)  # Check every 10 seconds
-        
-        # Print exit message to diagnose monitor issues
-        self.console.print(f"[dim]Inactivity monitor stopped for {self.config.get('active_profile', 'default')} profile[/dim]")
+            # Check every 10 seconds
+            time.sleep(10)
 
 class APIServer:
     def __init__(self, cli):
@@ -1393,23 +1135,24 @@ class APIServer:
         self.app = FastAPI()
         self.router = APIRouter()
         self.setup_routes()
+        
+        # Server state
         self.server = None
         self.running = False
-        # Use values from configuration or fallback to defaults
-        self.host = self.cli.config.get("api_host", "0.0.0.0")
+        self.thread = None
+        
+        # Configuration
+        self.host = self.cli.config.get("api_host", "0.0.0.0") 
         self.port = self.cli.config.get("api_port", self.cli.default_config["api_port"])
-        # Thread-safe request tracking
+        self.ready_timeout = self.cli.config.get("server_ready_timeout", self.cli.default_config["server_ready_timeout"])
+        self.timeout = 30 # Timeout for server requests
+        
+        # Request tracking
         self.active_requests = 0
         self.active_streams = 0
         self.active_requests_lock = threading.Lock()
         self.active_streams_lock = threading.Lock()
-        # Load the readiness timeout using default_config as fallback
-        self.ready_timeout = self.cli.config.get(
-            "server_ready_timeout", self.cli.default_config["server_ready_timeout"]
-        )
-        self.lock = threading.Lock()  # Add a lock for model switching
-        self.timeout = 30  # Timeout for server requests (This is for the request *forwarding*, not readiness check)
-        self.active_requests = 0  # Counter for ongoing requests
+        self.lock = threading.Lock() # Lock for model switching
 
     def setup_routes(self):
         self.router.add_api_route("/v1/models", self.list_models, methods=["GET"])
@@ -1824,9 +1567,8 @@ class APIServer:
                                     self.active_requests = 0
                             
                             # Now set can_kill to true
-                            with self.cli.can_kill_lock:
-                                self.cli.can_kill = True
-                                # console.print("[yellow]Enabling server shutdown after abandoned stream[/yellow]")
+                            self.cli.can_kill = True
+                            # console.print("[yellow]Enabling server shutdown after abandoned stream[/yellow]")
                             
                         except Exception as e:
                             console.print(f"[red]Stream watchdog error: {e}[/red]")
@@ -1930,137 +1672,71 @@ class APIServer:
                 
                 # If there are no active requests or streams, allow the server to be killed
                 if all_done:
-                    with self.cli.can_kill_lock:
-                        self.cli.can_kill = True
+                    self.cli.can_kill = True
 
     def wait_for_server_ready(self):
         """Wait for llama-server to be ready to accept requests"""
         start = time.time()
         console.print("[yellow]Waiting for server to be ready...[/yellow]")
-        # Use the instance variable self.ready_timeout
+        
         while time.time() - start < self.ready_timeout:
             try:
-                # First check if the server process is still running
-                if (
-                    not self.cli.llama_server_process
-                    or self.cli.llama_server_process.poll() is not None
-                ):
-                    self.cli._handle_error(
-                        "waiting for server", "Server process has stopped", True
-                    )
+                # Check if the server process is still running
+                if not self.cli.llama_server_process or self.cli.llama_server_process.poll() is not None:
+                    console.print("[red]Server process has stopped[/red]")
                     return False
 
-                # Try a basic health check first
-                model_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/models"
-                model_res = requests.get(model_url, timeout=2)
-                if model_res.status_code == 200:
-                    # Try a simple completion to ensure model is fully loaded
-                    test_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
-                    test_payload = {
-                        "messages": [{"role": "user", "content": "test"}],
-                        "max_tokens": 1,
-                        "temperature": 0,
-                        "stream": False,  # Explicitly disable streaming for test
-                    }
-                    try:
-                        test_res = requests.post(test_url, json=test_payload, timeout=5)
-                        if test_res.status_code != 200:
-                            error_details = test_res.text or "No error details"
-                            console.print(
-                                f"[yellow]Server not ready yet. Response: {error_details}[/yellow]"
-                            )
-                        else:
-                            console.print("[green]Server is ready[/green]")
-                            return True
-                    except requests.RequestException as e:
-                        console.print(
-                            f"[yellow]Server starting up... ({str(e)})[/yellow]"
-                        )
-            except requests.RequestException as e:
-                console.print(f"[yellow]Waiting for server... ({str(e)})[/yellow]")
-            time.sleep(1)  # Keep the 1-second sleep between checks
-        # Use self.ready_timeout in the error message
-        self.cli._handle_error(
-            "waiting for server",
-            f"Server startup timed out after {self.ready_timeout} seconds",
-            True,
-        )
-        return False
-        
-    def _clean_exit_on_disconnect(self, active_requests_before=None):
-        """Properly update state when client disconnects to ensure timer can restart
-        
-        This method is called when a client disconnects during a streaming request
-        or when an error occurs in request handling. It ensures the inactivity timer
-        can work properly by:
-        
-        1. Checking active requests/streams to see if we're at zero activity
-        2. Setting the can_kill flag to True only when all requests are complete
-        3. Optionally using the previous active_requests count to be more precise
-           about when to allow server shutdown
-        
-        This helps prevent resource waste when clients abruptly disconnect or 
-        when errors occur in request handling.
-        
-        Args:
-            active_requests_before: Optional count of active requests before disconnect,
-                                    used to make more precise decisions about resetting timer
-        """
-        
-        # If we know the active_requests before, we should decrement it
-        if active_requests_before is not None:
-            console.print(f"[dim]Client disconnect with {active_requests_before} previous active requests[/dim]")
-            with self.active_requests_lock:
-                # Ensure we don't go below zero
-                if self.active_requests >= active_requests_before:
-                    self.active_requests -= active_requests_before
+                # Try a simple completion to ensure model is fully loaded
+                test_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
+                test_payload = {
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                    "stream": False,
+                }
+                
+                test_res = requests.post(test_url, json=test_payload, timeout=5)
+                if test_res.status_code == 200:
+                    console.print("[green]Server is ready[/green]")
+                    return True
                 else:
-                    # If there's a mismatch, forcibly reset
-                    console.print("[yellow]Request count mismatch detected, forcing reset[/yellow]")
-                    self.active_requests = 0
-        else:
-            # More aggressive approach - if disconnect without known count, reset everything
-            console.print("[yellow]Client disconnect without request count, forcing full reset[/yellow]")
-            with self.active_requests_lock:
-                if self.active_requests > 0:
-                    console.print(f"[yellow]Forcing reset of {self.active_requests} requests[/yellow]")
-                    self.active_requests = 0
-            
-            with self.active_streams_lock:
-                if self.active_streams > 0:
-                    console.print(f"[yellow]Forcing reset of {self.active_streams} streams[/yellow]")
-                    self.active_streams = 0
+                    console.print(f"[yellow]Server not ready yet. Response: {test_res.status_code}[/yellow]")
+            except requests.RequestException:
+                console.print("[yellow]Waiting for server...[/yellow]")
+                
+            time.sleep(1)
         
-        # Now check if we should enable server shutdown
-        with self.active_requests_lock, self.active_streams_lock:
-            if self.active_requests == 0 and self.active_streams == 0:
-                with self.cli.can_kill_lock:
-                    self.cli.can_kill = True
-                    console.print("[yellow]All clients disconnected, enabling server shutdown[/yellow]")
+        console.print(f"[red]Server startup timed out after {self.ready_timeout} seconds[/red]")
+        return False
 
-    def reset_counters(self):
-        """Force reset all request and stream counters and enable server shutdown
+    def _clean_exit_on_disconnect(self, active_requests_before=None):
+        """Reset request counters when client disconnects"""
+        console.print("[yellow]Client disconnected - cleaning up request state[/yellow]")
         
-        This is a more aggressive version of _clean_exit_on_disconnect that can be 
-        called manually when needed to ensure the server can be properly shut down.
-        """
-        console.print("[yellow]Forcing reset of all request and stream counters[/yellow]")
-        
+        # Reset request counters
         with self.active_requests_lock:
-            if self.active_requests > 0:
-                console.print(f"[yellow]Resetting {self.active_requests} active requests[/yellow]")
-                self.active_requests = 0
+            self.active_requests = 0
         
         with self.active_streams_lock:
-            if self.active_streams > 0:
-                console.print(f"[yellow]Resetting {self.active_streams} active streams[/yellow]")
-                self.active_streams = 0
+            self.active_streams = 0
         
         # Enable server shutdown
-        with self.cli.can_kill_lock:
-            self.cli.can_kill = True
+        self.cli.can_kill = True
+
+    def reset_counters(self):
+        """Force reset all request and stream counters and enable server shutdown"""
+        console.print("[yellow]Resetting request counters[/yellow]")
         
-        console.print("[green]Counters reset, server shutdown is now enabled[/green]")
+        with self.active_requests_lock:
+            self.active_requests = 0
+        
+        with self.active_streams_lock:
+            self.active_streams = 0
+        
+        # Enable server shutdown
+        self.cli.can_kill = True
+        
+        console.print("[green]Counters reset, server shutdown enabled[/green]")
 
     def start(self):
         if not self.running:
