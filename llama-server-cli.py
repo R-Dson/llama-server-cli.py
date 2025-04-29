@@ -129,13 +129,14 @@ class LlamaServerCLI:
         # Create API server
         self.api_server = APIServer(self)
         self.api_thread = None
-        # Add state for inactivity tracking
-        self.last_activity_time = time.time()
-        self.activity_lock = threading.Lock()
-        self.inactivity_monitor_running = False
+        # Thread-safe flag to control whether the inactivity timer can kill the server
+        self.can_kill = True
+        self.can_kill_lock = threading.Lock()
+        # Last activity timestamp
+        self.last_activity_timestamp = time.time()
+        self.last_activity_lock = threading.Lock()
+        # Inactivity monitor thread
         self.inactivity_monitor_thread = None
-        # Start the inactivity monitor
-        self.start_inactivity_monitor()
 
     def _output_reader(self, process, queue, handle_ending=True):
         """Common output reading function for process streams"""
@@ -458,6 +459,7 @@ class LlamaServerCLI:
                 "api_host",
                 "api_port",
                 "inactivity_timeout",
+                "server_ready_timeout",  # Add this key here
                 "no-perf",
             ]
         )
@@ -560,9 +562,6 @@ class LlamaServerCLI:
                 universal_newlines=True,
             )
 
-            # Reset inactivity timer on successful start
-            self.update_activity_time()
-
             # In background mode, start a thread to read output and put it in the queue
             if background and output_queue:
                 reader_thread = threading.Thread(
@@ -575,6 +574,9 @@ class LlamaServerCLI:
                 )
                 reader_thread.start()
 
+                # Start inactivity monitor
+                self.start_inactivity_monitor()
+                
                 return True
 
             # In foreground mode, print the output directly
@@ -610,19 +612,95 @@ class LlamaServerCLI:
             console.print("[yellow]Stopping llama-server...[/yellow]")
             try:
                 self.llama_server_process.terminate()
-                # Wait up to 5 seconds for graceful termination
+                # Wait up to 10 seconds for graceful termination
                 try:
-                    self.llama_server_process.wait(timeout=5)
+                    self.llama_server_process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     console.print("[red]Server not responding, forcing kill...[/red]")
                     self.llama_server_process.kill()
+                    try:
+                        self.llama_server_process.wait(timeout=2)
+                    except:
+                        pass
             except Exception as e:
                 console.print(f"[red]Error stopping server: {e}[/red]")
 
+            # Ensure server is really stopped by checking for any remaining processes
+            self.ensure_server_shutdown()
+            
             self.llama_server_process = None
             console.print("[green]Server stopped[/green]")
         else:
+            # Even if process reference is missing, try to make sure no servers are running
+            self.ensure_server_shutdown()
             console.print("[yellow]No running server to stop[/yellow]")
+            
+    def ensure_server_shutdown(self) -> None:
+        """Ensure all llama-server processes are terminated
+        
+        This is a safety measure to handle cases where the process reference
+        is lost but the actual process is still running.
+        """
+        try:
+            # Try to find and kill any remaining llama-server processes
+            if os.name == 'posix':  # Linux/Mac
+                # First check if there are any processes matching the specific executable
+                check_result = subprocess.run(
+                    ["pgrep", "-f", r"\./llama-server"], # More specific pattern
+                    capture_output=True,
+                    text=True
+                )
+                
+                # If we found processes, try to kill them
+                if check_result.returncode == 0 and check_result.stdout.strip():
+                    pids = check_result.stdout.strip().split('\\n')
+                    console.print(f"[yellow]Found {len(pids)} \\'./llama-server\\' processes still running. Terminating...[/yellow]")
+                    
+                    # Try gentle SIGTERM first with specific pattern
+                    kill_result = subprocess.run(
+                        ["pkill", "-TERM", "-f", r"\./llama-server"], # More specific pattern
+                        capture_output=True
+                    )
+                    
+                    # Wait a bit for processes to terminate
+                    time.sleep(2)
+                    
+                    # Check if anything is still running and use SIGKILL if needed
+                    check_again = subprocess.run(
+                        ["pgrep", "-f", r"\./llama-server"], # More specific pattern
+                        capture_output=True
+                    )
+                    
+                    if check_again.returncode == 0:
+                        console.print("[red]Some processes still running, forcing kill...[/red]")
+                        subprocess.run(
+                            ["pkill", "-KILL", "-f", r"\./llama-server"], # More specific pattern
+                            capture_output=True
+                        )
+                        
+                    console.print("[green]All \\'./llama-server\\' processes terminated[/green]")
+            
+            elif os.name == 'nt':  # Windows
+                # Check for running llama-server.exe processes
+                check_result = subprocess.run(
+                    # Target specific executable
+                    ["tasklist", "/fi", "imagename eq llama-server.exe"], 
+                    capture_output=True,
+                    text=True
+                )
+                
+                # Check if the executable name is in the output
+                if "llama-server.exe" in check_result.stdout:
+                    console.print("[yellow]Found llama-server.exe processes still running. Terminating...[/yellow]")
+                    subprocess.run(
+                        # Target specific executable
+                        ["taskkill", "/IM", "llama-server.exe", "/F"],
+                        capture_output=True
+                    )
+                    console.print("[green]All llama-server.exe processes terminated[/green]")
+        
+        except Exception as e:
+            console.print(f"[red]Error ensuring server shutdown: {e}[/red]")
 
     def interactive_config(self) -> None:
         """Interactive configuration mode"""
@@ -810,7 +888,6 @@ class LlamaServerCLI:
                         console.print(
                             "[green]Llama Server started in background mode[/green]"
                         )
-                        self.update_activity_time()
                     time.sleep(1)
 
                 elif choice == "Stop Llama Server":
@@ -828,7 +905,6 @@ class LlamaServerCLI:
                         console.print(
                             "[green]Llama Server restarted in background mode[/green]"
                         )
-                        self.update_activity_time()
                     time.sleep(1)
 
                 elif choice == "Start API Server":
@@ -873,7 +949,6 @@ class LlamaServerCLI:
                 console.print("[yellow]Stopping API Server before exit...[/yellow]")
                 self.api_server.stop()
             print("\nExiting...")
-            sys.exit(0)
 
     def _interactive_edit_profile(self, profile_name: str) -> None:
         """Interactive profile editor"""
@@ -1045,6 +1120,7 @@ class LlamaServerCLI:
                 self.llama_server_process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.llama_server_process.kill()
+                self.llama_server_process.wait()
 
             # Start new server silently
             bg_queue = queue.Queue()
@@ -1063,9 +1139,6 @@ class LlamaServerCLI:
                     universal_newlines=True,
                 )
 
-                # Reset inactivity timer on successful restart
-                self.update_activity_time()
-
                 # Set up background output reader
                 reader_thread = threading.Thread(
                     target=lambda: self._output_reader(
@@ -1075,96 +1148,244 @@ class LlamaServerCLI:
                 reader_thread.daemon = True
                 reader_thread.start()
 
+                # Reset activity timestamp and can_kill flag
+                with self.last_activity_lock:
+                    self.last_activity_timestamp = time.time()
+                with self.can_kill_lock:
+                    self.can_kill = False
+
+                # Restart inactivity monitor
+                self.start_inactivity_monitor()
+
                 return True
             except Exception:
                 return False
         return False
 
-    def update_activity_time(self):
-        """Reset the inactivity timer by updating the last activity time."""
-        with self.activity_lock:
-            self.last_activity_time = time.time()
-            # Optional: Log activity detection
-            # console.print("[dim]Activity detected, timer reset.[/dim]")
-
     def start_inactivity_monitor(self):
-        """Start the background thread that monitors server inactivity."""
-        if (
-            not self.inactivity_monitor_thread
-            or not self.inactivity_monitor_thread.is_alive()
-        ):
-            self.inactivity_monitor_running = True
+        """Start the inactivity monitor thread if not already running
+        
+        This starts a background thread that monitors server activity and automatically
+        shuts down the llama-server process after a period of inactivity (defined by
+        inactivity_timeout in the config).
+        
+        The monitor uses a thread-safe 'can_kill' flag to determine if it's allowed to
+        stop the server. This flag is set to False whenever an API request is being
+        processed, and set to True when all requests are complete.
+        
+        The monitor will:
+        1. Only kill the server if can_kill=True and inactivity_timeout has elapsed
+        2. Reset its timer if activity occurs or can_kill=False when timeout is reached
+        3. Exit automatically if the server process is no longer running
+        """
+        # Update the activity timestamp when starting the monitor
+        with self.last_activity_lock:
+            self.last_activity_timestamp = time.time()
+        
+        # Only start if not already running
+        if self.inactivity_monitor_thread is None or not self.inactivity_monitor_thread.is_alive():
             self.inactivity_monitor_thread = threading.Thread(
                 target=self._inactivity_monitor_loop
             )
-            self.inactivity_monitor_thread.daemon = True  # Ensure it doesn't block exit
+            self.inactivity_monitor_thread.daemon = True
             self.inactivity_monitor_thread.start()
-            # console.print("[dim]Inactivity monitor started.[/dim]")
-
-    def stop_inactivity_monitor(self):
-        """Signal the inactivity monitor thread to stop."""
-        self.inactivity_monitor_running = False
-        if self.inactivity_monitor_thread and self.inactivity_monitor_thread.is_alive():
-            # console.print("[dim]Stopping inactivity monitor...[/dim]")
-            self.inactivity_monitor_thread.join(
-                timeout=2
-            )  # Wait briefly for it to exit
-
+            self.console.print("[dim]Inactivity monitor started[/dim]")
+    
+    def update_activity_timestamp(self):
+        """Update the last activity timestamp to prevent server shutdown
+        
+        This method should be called whenever there is activity on the server 
+        (such as an API request being processed). It performs two functions:
+        
+        1. Updates the last_activity_timestamp to the current time
+        2. Sets can_kill to False to prevent the inactivity monitor from 
+           shutting down the server during ongoing operations
+           
+        The can_kill flag will be set back to True when all API requests 
+        are completed.
+        """
+        with self.last_activity_lock:
+            self.last_activity_timestamp = time.time()
+            # When activity occurs, we should NOT kill the server
+            with self.can_kill_lock:
+                self.can_kill = False
+    
     def _inactivity_monitor_loop(self):
-        """Periodically checks for inactivity and stops the server if needed."""
-        while self.inactivity_monitor_running:
-            SLEEP_TIME = 10
+        """Monitor inactivity and shut down server when idle for too long
+        
+        This is the main loop for the inactivity monitor thread. It:
+        
+        1. Checks if the server is running
+        2. Calculates the time since the last activity
+        3. Checks the thread-safe can_kill flag 
+        4. If both the inactivity_timeout has elapsed AND can_kill is True,
+           it shuts down the server to save resources
+        5. If inactivity_timeout has elapsed but can_kill is False (indicating
+           server is still in use), it resets the timer
+        6. Loops every 10 seconds until the server is stopped
+        
+        This logic ensures the server is only shut down when truly idle,
+        preserving the user experience while saving resources.
+        """
+        # Print a startup message to diagnose monitor issues
+        self.console.print(f"[dim]Inactivity monitor started for {self.config.get('active_profile', 'default')} profile[/dim]")
+        
+        # Store the process ID at the start for better tracking
+        server_pid = None
+        if self.llama_server_process:
             try:
-                # Check if the server process is actually running
-                is_running = (
-                    self.llama_server_process
-                    and self.llama_server_process.poll() is None
-                )
-
-                if is_running:
-                    # Get the current timeout setting
-                    settings = self.get_active_settings()
-                    timeout = settings.get(
-                        "inactivity_timeout", 0
-                    )  # Default to 0 if not set
-
-                    # Proceed only if timeout is positive
-                    if timeout and timeout > 0:
-                        # Ensure timeout is treated as a number
+                server_pid = self.llama_server_process.pid
+                self.console.print(f"[dim]Monitoring llama-server process PID: {server_pid}[/dim]")
+            except:
+                pass
+        
+        while True:
+            try:
+                # Check if the server is actually running using multiple methods
+                server_running = False
+                
+                # Method 1: Check via the stored process reference
+                process_alive = False
+                if self.llama_server_process and self.llama_server_process.poll() is None:
+                    process_alive = True
+                
+                # Method 2: If we have a PID, try to directly check if that process exists
+                pid_alive = False
+                if server_pid:
+                    try:
+                        # Call os.kill with signal 0 to check if process exists
+                        os.kill(server_pid, 0)
+                        pid_alive = True
+                    except OSError:
+                        pid_alive = False
+                    except:
+                        pass
+                
+                # Method 3: Check if there are any llama-server processes running on the system
+                system_alive = False
+                try:
+                    # Try to find llama-server in running processes
+                    if os.name == 'posix':  # Linux/Mac
+                        check_result = subprocess.run(
+                            ["pgrep", "-f", "llama-server"], 
+                            capture_output=True, 
+                            text=True
+                        )
+                        if check_result.returncode == 0 and check_result.stdout.strip():
+                            system_alive = True
+                    elif os.name == 'nt':  # Windows
+                        check_result = subprocess.run(
+                            ["tasklist", "/fi", "imagename eq llama-server*"], 
+                            capture_output=True, 
+                            text=True
+                        )
+                        if "llama-server" in check_result.stdout:
+                            system_alive = True
+                except:
+                    pass
+                    
+                # Combine all methods - server is running if any method says it's alive
+                server_running = process_alive or pid_alive or system_alive
+                
+                # Debug output for process detection methods
+                if process_alive != pid_alive or process_alive != system_alive:
+                    self.console.print(f"[yellow]Process detection mismatch: process_alive={process_alive}, pid_alive={pid_alive}, system_alive={system_alive}[/yellow]")
+                
+                if server_running:
+                    current_time = time.time()
+                    timeout_seconds = self.config.get("inactivity_timeout", self.default_config["inactivity_timeout"])
+                    
+                    # Check if we're allowed to kill the server
+                    can_kill = False
+                    with self.can_kill_lock:
+                        can_kill = self.can_kill
+                    
+                    # Get the last activity time
+                    last_activity = 0
+                    with self.last_activity_lock:
+                        last_activity = self.last_activity_timestamp
+                    
+                    # Calculate time since last activity
+                    idle_time = current_time - last_activity
+                    
+                    # Check if there are active requests through the API server
+                    active_api_requests = False
+                    if hasattr(self, 'api_server') and self.api_server.running:
+                        with self.api_server.active_requests_lock:
+                            if self.api_server.active_requests > 0:
+                                active_api_requests = True
+                                # self.console.print(f"[dim]Active API requests detected: {self.api_server.active_requests}[/dim]")
+                        with self.api_server.active_streams_lock:
+                            if self.api_server.active_streams > 0:
+                                active_api_requests = True
+                                # self.console.print(f"[dim]Active API streams detected: {self.api_server.active_streams}[/dim]")
+                    
+                    # If we have active API requests, update the timestamp
+                    if active_api_requests:
+                        with self.last_activity_lock:
+                            self.last_activity_timestamp = current_time
+                        # self.console.print("[dim]Active API requests detected, resetting timer[/dim]")
+                        time.sleep(2)
+                        continue
+                    
+                    # Check current status more frequently for debugging
+                    # if idle_time % 60 < 1:
+                    #     self.console.print(f"[dim]Server idle for {int(idle_time)} seconds (timeout: {timeout_seconds}, can_kill: {can_kill})[/dim]")
+                    
+                    # If we've been idle for longer than the timeout and we're allowed to kill
+                    if idle_time >= timeout_seconds and can_kill:
+                        self.console.print(f"[yellow]Server idle for {int(idle_time)} seconds, shutting down...[/yellow]")
+                        self.stop_server()
+                        break
+                    
+                    # If idle time is extremely long (3x the timeout), force a shutdown regardless of can_kill
+                    elif idle_time >= (timeout_seconds * 3):
+                        self.console.print(f"[red]Server idle for {int(idle_time)} seconds (3x timeout)! Forcing shutdown...[/red]")
+                        # Force reset API counters if there are any
+                        if hasattr(self, 'api_server') and self.api_server.running:
+                            self.api_server.reset_counters()
+                        self.stop_server()
+                        break
+                    
+                    # Log periodic status if close to timeout
+                    # elif idle_time >= (timeout_seconds * 0.8) and idle_time % 60 < 1:
+                    #     self.console.print(f"[dim]Server idle for {int(idle_time)} seconds (timeout: {timeout_seconds})[/dim]")
+                else:
+                    # Try to kill the process if any of the detection methods found it alive
+                    if pid_alive or system_alive:
+                        self.console.print(f"[yellow]Process reference lost but server may still be running (PID: {server_pid}). Attempting to terminate...[/yellow]")
                         try:
-                            timeout_seconds = int(timeout)
-                            if timeout_seconds <= 0:
-                                # Skip check if timeout is zero or negative
-                                time.sleep(SLEEP_TIME)  # Still sleep before next check
-                                continue
-                        except (ValueError, TypeError):
-                            console.print(
-                                f"[red]Invalid inactivity_timeout value: {timeout}. Must be a number.[/red]"
-                            )
-                            # Use a default sleep or skip check? Let's skip check for this cycle.
-                            time.sleep(SLEEP_TIME)
-                            continue
-
-                        with self.activity_lock:
-                            idle_time = time.time() - self.last_activity_time
-
-                        if idle_time > timeout_seconds:
-                            console.print(
-                                f"[yellow]Server inactive for {idle_time:.0f}s (>{timeout_seconds}s timeout), stopping...[/yellow]"
-                            )
-                            self.stop_server()
-                            # No need to update last_activity_time here, server is stopped
-
-                # Sleep for a reasonable interval before checking again
-                # Only sleep if the monitor should still be running
-                if self.inactivity_monitor_running:
-                    time.sleep(SLEEP_TIME)  # Check every 30 seconds
-
+                            # Try to terminate the process if we have the PID
+                            if server_pid:
+                                if os.name == 'posix':  # Linux/Mac
+                                    os.kill(server_pid, signal.SIGTERM)
+                                # elif os.name == 'nt':  # Windows
+                                #     subprocess.run(["taskkill", "/PID", str(server_pid), "/F"], capture_output=True)
+                            
+                            # Fallback - try to kill all llama-server processes
+                            if os.name == 'posix':  # Linux/Mac
+                                subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
+                            # elif os.name == 'nt':  # Windows
+                            #     subprocess.run(["taskkill", "/IM", "llama-server*", "/F"], capture_output=True)
+                                
+                            self.console.print(f"[green]Successfully terminated stray llama-server processes[/green]")
+                        except Exception as kill_err:
+                            self.console.print(f"[red]Error terminating process: {kill_err}[/red]")
+                    
+                    # Server not running, exit the loop
+                    self.console.print(f"[dim]Server process no longer running. Exiting inactivity monitor.[/dim]")
+                    break
             except Exception as e:
-                # Log errors but keep the monitor running
-                console.print(f"[red]Error in inactivity monitor: {e}[/red]")
-                time.sleep(60)  # Wait longer after an error
-
+                self.console.print(f"[red]Error in inactivity monitor: {e}[/red]")
+                # Print traceback for better debugging
+                import traceback
+                self.console.print(f"[red]{traceback.format_exc()}[/red]")
+            
+            # Sleep for a bit before checking again
+            time.sleep(10)  # Check every 10 seconds
+        
+        # Print exit message to diagnose monitor issues
+        self.console.print(f"[dim]Inactivity monitor stopped for {self.config.get('active_profile', 'default')} profile[/dim]")
 
 class APIServer:
     def __init__(self, cli):
@@ -1177,12 +1398,18 @@ class APIServer:
         # Use values from configuration or fallback to defaults
         self.host = self.cli.config.get("api_host", "0.0.0.0")
         self.port = self.cli.config.get("api_port", self.cli.default_config["api_port"])
+        # Thread-safe request tracking
+        self.active_requests = 0
+        self.active_streams = 0
+        self.active_requests_lock = threading.Lock()
+        self.active_streams_lock = threading.Lock()
         # Load the readiness timeout using default_config as fallback
         self.ready_timeout = self.cli.config.get(
             "server_ready_timeout", self.cli.default_config["server_ready_timeout"]
         )
         self.lock = threading.Lock()  # Add a lock for model switching
         self.timeout = 30  # Timeout for server requests (This is for the request *forwarding*, not readiness check)
+        self.active_requests = 0  # Counter for ongoing requests
 
     def setup_routes(self):
         self.router.add_api_route("/v1/models", self.list_models, methods=["GET"])
@@ -1321,6 +1548,10 @@ class APIServer:
                     raise HTTPException(
                         503, f"Server startup timed out for profile '{model}'"
                     )
+                
+                # Explicitly ensure the inactivity monitor is running
+                console.print("[yellow]Starting inactivity monitor for new model...[/yellow]")
+                self.cli.start_inactivity_monitor()
 
             # --- End: Modify condition ---
 
@@ -1338,9 +1569,17 @@ class APIServer:
                     503, "Llama server is not running despite startup attempt"
                 )
 
-            # --- Add: Update activity time ---
-            self.cli.update_activity_time()
-            # --- End: Update activity time ---
+            # Update activity timestamp and disable can_kill flag
+            self.cli.update_activity_timestamp()
+            
+            # Track active requests
+            with self.active_requests_lock:
+                self.active_requests += 1
+            
+            is_streaming = request.get("stream", False)
+            if is_streaming:
+                with self.active_streams_lock:
+                    self.active_streams += 1
 
             # Forward request to the running llama-server
             server_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
@@ -1356,6 +1595,10 @@ class APIServer:
 
                 # For streaming requests, use stream=True
                 is_streaming = request.get("stream", False)
+                
+                # Set shorter socket timeout for streaming to detect disconnects faster
+                request_timeout = 5 if is_streaming else self.timeout
+                
                 response = requests.post(
                     server_url,
                     json=request,
@@ -1365,7 +1608,7 @@ class APIServer:
                         if is_streaming
                         else "application/json",
                     },
-                    timeout=self.timeout,
+                    timeout=request_timeout,  # Use shorter timeout for streaming
                     stream=is_streaming,
                 )
 
@@ -1402,7 +1645,32 @@ class APIServer:
                         nonlocal has_usage, has_timings, final_chunk
 
                         try:
+                            # Set a separate timeout for each iteration
+                            iteration_timeout = time.time() + 10  # 10-second max per iteration
+                            
                             for line in response.iter_lines():
+                                # Update activity timestamp on each chunk
+                                self.cli.update_activity_timestamp()
+                                
+                                # Check for timeout on each iteration
+                                if time.time() > iteration_timeout:
+                                    # console.print("[yellow]Stream iteration timeout - client may be slow or disconnected[/yellow]")
+                                    
+                                    # Increment the timeout count and check if we've had too many consecutive timeouts
+                                    consecutive_timeouts = getattr(self, '_timeout_count', 0) + 1
+                                    setattr(self, '_timeout_count', consecutive_timeouts)
+                                    
+                                    # If we've had 3 consecutive timeouts, assume the client is gone
+                                    if consecutive_timeouts >= 3:
+                                        console.print("[red]Three consecutive timeouts - forcing connection cleanup[/red]")
+                                        # Force-reset counters and raise an exception to break the loop
+                                        self._clean_exit_on_disconnect()
+                                        # Raise an exception to break out of the stream
+                                        raise ConnectionResetError("Forced disconnect after multiple timeouts")
+                                    
+                                    # Reset timeout for next iteration
+                                    iteration_timeout = time.time() + 10
+                                
                                 if line:
                                     # Store the data for analysis
                                     if line.startswith(b"data: "):
@@ -1422,8 +1690,11 @@ class APIServer:
 
                                     # Send each line as-is
                                     yield line + b"\n"
-
-                            # Send a final message with usage statistics
+                                    
+                                    # Reset consecutive timeout counter when data is flowing
+                                    setattr(self, '_timeout_count', 0)
+                                    
+                                    # Send a final message with usage statistics
                             total_duration = time.time() - start_time
 
                             # Create info using available data
@@ -1484,40 +1755,33 @@ class APIServer:
                             #     f"[green]Stream completed. Usage info: {json.dumps(info, indent=2)}[/green]"
                             # )
 
-                        except (BrokenPipeError, ConnectionResetError) as e:
+                        except (BrokenPipeError, ConnectionResetError, socket.error, requests.exceptions.ChunkedEncodingError, 
+                                requests.exceptions.ConnectionError, TimeoutError) as e:
                             # These are expected when client disconnects
                             console.print(
                                 f"[yellow]Client disconnected during streaming: {str(e)}[/yellow]"
                             )
                             console.print("Terminating stream gracefully.")
+                            # Clean up state to ensure timer restarts
+                            self._clean_exit_on_disconnect()
                             # No need to yield anything here as the client is gone
                             return
-                        except socket.error as e:
-                            console.print(
-                                f"[yellow]Socket error during streaming: {str(e)}[/yellow]"
-                            )
-                            console.print(
-                                "Client likely disconnected. Terminating stream gracefully."
-                            )
-                            # No need to yield anything here as the client is gone
-                            return
-                        except Exception as e:
-                            console.print(
-                                f"[red]Error during streaming: {str(e)}[/red]"
-                            )
-                            # Log additional info for debugging
-                            console.print(
-                                "[yellow]Client likely disconnected. Terminating stream gracefully.[/yellow]"
-                            )
-                            # Send a final message indicating the stream was interrupted
-                            error_message = str(e).replace(
-                                "'", "\\'"
-                            )  # Escape single quotes for JSON
-                            yield f'data: {{"error": "Stream interrupted: {error_message}", "finish_reason": "client_disconnected"}}\n\n'.encode(
-                                "utf-8"
-                            )
+                        finally:
+                            # Decrement active streams counter
+                            with self.active_streams_lock:
+                                self.active_streams -= 1
+                            
+                            # Clean up state after request completes or client disconnects
+                            with self.active_requests_lock:
+                                self.active_requests -= 1
 
-                    return StreamingResponse(
+                            # Log completion or disconnection info
+                            if not hasattr(response, 'closed') or response.closed:
+                                console.print(
+                                    "[yellow]Client likely disconnected. Terminating stream gracefully.[/yellow]"
+                                )
+
+                    response_obj = StreamingResponse(
                         stream_generator(),
                         media_type="text/event-stream",
                         status_code=200,
@@ -1528,6 +1792,52 @@ class APIServer:
                             "X-Accel-Buffering": "no",  # Disable buffering in Nginx
                         },
                     )
+                    
+                    # Set a timer to ensure the server can be killed if streams get abandoned
+                    def stream_watchdog():
+                        # Wait a reasonable time for normal streaming completion
+                        stream_timeout = 60  # 60 seconds max wait for natural completion
+                        stream_start = time.time()
+                        
+                        try:
+                            # Wait for either stream completion or timeout
+                            while time.time() - stream_start < stream_timeout:
+                                # Check if we've completed normally
+                                with self.active_streams_lock:
+                                    if self.active_streams == 0:
+                                        #console.print("[dim]Stream completed normally.[/dim]")
+                                        return
+                                time.sleep(1)
+                            
+                            # If we're here, watchdog timed out - handle abandoned stream
+                            # console.print("[yellow]Stream watchdog: Stream may be abandoned.[/yellow]")
+                            
+                            # Forcibly reset counters to ensure clean exit
+                            with self.active_streams_lock:
+                                if self.active_streams > 0:
+                                    # console.print(f"[yellow]Forcing reset of {self.active_streams} abandoned streams[/yellow]")
+                                    self.active_streams = 0
+                            
+                            with self.active_requests_lock:
+                                if self.active_requests > 0:
+                                    # console.print(f"[yellow]Forcing reset of {self.active_requests} abandoned requests[/yellow]")
+                                    self.active_requests = 0
+                            
+                            # Now set can_kill to true
+                            with self.cli.can_kill_lock:
+                                self.cli.can_kill = True
+                                # console.print("[yellow]Enabling server shutdown after abandoned stream[/yellow]")
+                            
+                        except Exception as e:
+                            console.print(f"[red]Stream watchdog error: {e}[/red]")
+                    
+                    # Start watchdog in background thread
+                    watchdog = threading.Thread(target=stream_watchdog)
+                    watchdog.daemon = True
+                    watchdog.start()
+                    
+                    # Return the streaming response
+                    return response_obj
 
                 # For non-streaming, use server-provided metrics
                 response_json = response.json()
@@ -1590,24 +1900,39 @@ class APIServer:
                 )
                 return response_json
 
-            except requests.exceptions.ConnectionError as e:
+            except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
                 console.print(f"[red]Connection error: {str(e)}[/red]")
                 raise HTTPException(
                     503, "Could not connect to llama-server. Is it running?"
                 )
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, requests.exceptions.ChunkedEncodingError) as e:
                 console.print(f"[red]Request error: {str(e)}[/red]")
                 raise HTTPException(500, f"Error forwarding request: {str(e)}")
-            except (BrokenPipeError, ConnectionResetError, socket.error) as e:
+            except (BrokenPipeError, ConnectionResetError, socket.error, TimeoutError) as e:
                 console.print(f"[yellow]Client connection error: {str(e)}[/yellow]")
                 console.print("Client likely disconnected during the request.")
+                # Use our utility to properly reset state
+                self._clean_exit_on_disconnect(self.active_requests)
                 # For API consistency, still raise an exception
                 raise HTTPException(499, "Client Closed Request")
             except Exception as e:
                 console.print(f"[red]Unexpected error: {str(e)}[/red]")
                 raise HTTPException(500, f"Unexpected error: {str(e)}")
+            finally:
+                
+                # Decrement active requests counter
+                with self.active_requests_lock:
+                    self.active_requests -= 1
+                
+                # Only allow server to be killed if all requests and streams are complete
+                with self.active_streams_lock:
+                    all_done = self.active_requests == 0 and self.active_streams == 0
+                
+                # If there are no active requests or streams, allow the server to be killed
+                if all_done:
+                    with self.cli.can_kill_lock:
+                        self.cli.can_kill = True
 
-    # Remove timeout parameter from signature
     def wait_for_server_ready(self):
         """Wait for llama-server to be ready to accept requests"""
         start = time.time()
@@ -1661,6 +1986,81 @@ class APIServer:
             True,
         )
         return False
+        
+    def _clean_exit_on_disconnect(self, active_requests_before=None):
+        """Properly update state when client disconnects to ensure timer can restart
+        
+        This method is called when a client disconnects during a streaming request
+        or when an error occurs in request handling. It ensures the inactivity timer
+        can work properly by:
+        
+        1. Checking active requests/streams to see if we're at zero activity
+        2. Setting the can_kill flag to True only when all requests are complete
+        3. Optionally using the previous active_requests count to be more precise
+           about when to allow server shutdown
+        
+        This helps prevent resource waste when clients abruptly disconnect or 
+        when errors occur in request handling.
+        
+        Args:
+            active_requests_before: Optional count of active requests before disconnect,
+                                    used to make more precise decisions about resetting timer
+        """
+        
+        # If we know the active_requests before, we should decrement it
+        if active_requests_before is not None:
+            console.print(f"[dim]Client disconnect with {active_requests_before} previous active requests[/dim]")
+            with self.active_requests_lock:
+                # Ensure we don't go below zero
+                if self.active_requests >= active_requests_before:
+                    self.active_requests -= active_requests_before
+                else:
+                    # If there's a mismatch, forcibly reset
+                    console.print("[yellow]Request count mismatch detected, forcing reset[/yellow]")
+                    self.active_requests = 0
+        else:
+            # More aggressive approach - if disconnect without known count, reset everything
+            console.print("[yellow]Client disconnect without request count, forcing full reset[/yellow]")
+            with self.active_requests_lock:
+                if self.active_requests > 0:
+                    console.print(f"[yellow]Forcing reset of {self.active_requests} requests[/yellow]")
+                    self.active_requests = 0
+            
+            with self.active_streams_lock:
+                if self.active_streams > 0:
+                    console.print(f"[yellow]Forcing reset of {self.active_streams} streams[/yellow]")
+                    self.active_streams = 0
+        
+        # Now check if we should enable server shutdown
+        with self.active_requests_lock, self.active_streams_lock:
+            if self.active_requests == 0 and self.active_streams == 0:
+                with self.cli.can_kill_lock:
+                    self.cli.can_kill = True
+                    console.print("[yellow]All clients disconnected, enabling server shutdown[/yellow]")
+
+    def reset_counters(self):
+        """Force reset all request and stream counters and enable server shutdown
+        
+        This is a more aggressive version of _clean_exit_on_disconnect that can be 
+        called manually when needed to ensure the server can be properly shut down.
+        """
+        console.print("[yellow]Forcing reset of all request and stream counters[/yellow]")
+        
+        with self.active_requests_lock:
+            if self.active_requests > 0:
+                console.print(f"[yellow]Resetting {self.active_requests} active requests[/yellow]")
+                self.active_requests = 0
+        
+        with self.active_streams_lock:
+            if self.active_streams > 0:
+                console.print(f"[yellow]Resetting {self.active_streams} active streams[/yellow]")
+                self.active_streams = 0
+        
+        # Enable server shutdown
+        with self.cli.can_kill_lock:
+            self.cli.can_kill = True
+        
+        console.print("[green]Counters reset, server shutdown is now enabled[/green]")
 
     def start(self):
         if not self.running:
@@ -1980,6 +2380,12 @@ def interactive_config():
 def start_api_server():
     """Start the OpenAI-compatible API server"""
     cli.api_server.start()
+    # Start the inactivity monitor if server starts successfully and it's not already running
+    if cli.api_server.running:
+        # Only start the inactivity monitor if llama-server is running
+        if cli.llama_server_process and cli.llama_server_process.poll() is None:
+            cli.start_inactivity_monitor()
+    
     console.print("[yellow]Press Ctrl+C to stop the API server[/yellow]")
     try:
         # Keep the main thread alive
@@ -2000,6 +2406,19 @@ def stop_api_server():
         console.print("[yellow]API server is not running[/yellow]")
 
 
+@api_app.command("reset")
+def reset_api_counters():
+    """Reset all API request counters and enable server shutdown
+    
+    Use this command if the server is stuck and won't shut down automatically.
+    """
+    if cli.api_server.running:
+        cli.api_server.reset_counters()
+        console.print("[green]API counters reset, server shutdown is now enabled[/green]")
+    else:
+        console.print("[yellow]API server is not running[/yellow]")
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
     """LLama Server CLI Tool"""
@@ -2012,11 +2431,6 @@ def main(ctx: typer.Context):
             if cli.api_server.running:
                 console.print("[yellow]Stopping API server...[/yellow]")
                 cli.api_server.stop()
-            # Stop the inactivity monitor
-            if cli.inactivity_monitor_running:
-                cli.stop_inactivity_monitor()
-            if signum is not None:  # Only exit if called as signal handler
-                sys.exit(0)
 
         signal.signal(signal.SIGINT, cleanup)
         signal.signal(signal.SIGTERM, cleanup)
@@ -2054,6 +2468,91 @@ def find_gguf_models() -> List[str]:
     models.sort()
 
     return models
+
+
+@server_app.command("monitor")
+def restart_inactivity_monitor():
+    """Restart the inactivity monitor for the currently running server
+    
+    Use this if the server is running but the inactivity monitor has stopped.
+    """
+    # First check if server is running but monitor is not
+    server_running = False
+    monitor_running = False
+    
+    # Check if server is running via system processes
+    try:
+        if os.name == 'posix':  # Linux/Mac
+            check_result = subprocess.run(
+                ["pgrep", "-f", "llama-server"], 
+                capture_output=True, 
+                text=True
+            )
+            if check_result.returncode == 0 and check_result.stdout.strip():
+                server_running = True
+        elif os.name == 'nt':  # Windows
+            check_result = subprocess.run(
+                ["tasklist", "/fi", "imagename eq llama-server*"], 
+                capture_output=True, 
+                text=True
+            )
+            if "llama-server" in check_result.stdout:
+                server_running = True
+    except:
+        pass
+    
+    # Check if monitor thread is running
+    monitor_running = (
+        cli.inactivity_monitor_thread is not None 
+        and cli.inactivity_monitor_thread.is_alive()
+    )
+    
+    if not server_running:
+        console.print("[yellow]No llama-server process found running. Start the server first.[/yellow]")
+        return
+    
+    if monitor_running:
+        console.print("[yellow]Inactivity monitor is already running.[/yellow]")
+        return
+    
+    # Server is running but monitor is not - restart it
+    console.print("[green]Restarting inactivity monitor for running server...[/green]")
+    
+    # Reset the process reference if needed by finding the actual PID
+    if cli.llama_server_process is None or cli.llama_server_process.poll() is not None:
+        try:
+            # Find PID of running llama-server
+            if os.name == 'posix':  # Linux/Mac
+                check_result = subprocess.run(
+                    ["pgrep", "-f", "llama-server"], 
+                    capture_output=True, 
+                    text=True
+                )
+                if check_result.returncode == 0 and check_result.stdout.strip():
+                    # Just take the first PID if multiple are found
+                    pid = int(check_result.stdout.strip().split('\n')[0])
+                    # Create a new Process object from the PID
+                    cli.llama_server_process = subprocess.Popen(
+                        ['true'],  # Dummy command that doesn't do anything
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.STDOUT
+                    )
+                    # Replace the pid with the one we found
+                    cli.llama_server_process.pid = pid
+                    console.print(f"[green]Reconnected to llama-server process (PID: {pid})[/green]")
+            
+            # Windows version is more complex, skip for now
+        except Exception as e:
+            console.print(f"[yellow]Could not reconnect to process: {e}[/yellow]")
+            console.print("[yellow]Monitor will still restart but might not detect the server correctly.[/yellow]")
+    
+    # Reset counters in API server if it's running
+    if cli.api_server.running:
+        cli.api_server.reset_counters()
+    
+    # Start monitor
+    cli.start_inactivity_monitor()
+    console.print("[green]Inactivity monitor restarted successfully[/green]")
 
 
 if __name__ == "__main__":
