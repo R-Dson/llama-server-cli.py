@@ -119,6 +119,7 @@ class LlamaServerCLI:
             "api_host": "0.0.0.0",
             "api_port": 8000,
             "inactivity_timeout": 300,
+            "server_ready_timeout": 60,
             "profiles": {"default": {}},
         }
         # Now load config which may use default_config
@@ -709,18 +710,40 @@ class LlamaServerCLI:
                     # Add API server configuration
                     api_host = questionary.text(
                         "API Server Host:",
-                        default=str(self.config.get("api_host", "0.0.0.0")),
+                        # Use default_config as fallback for display
+                        default=str(
+                            self.config.get("api_host", self.default_config["api_host"])
+                        ),
                     ).ask()
 
                     api_port = questionary.text(
                         "API Server Port:",
-                        default=str(self.config.get("api_port", 8000)),
+                        # Use default_config as fallback for display
+                        default=str(
+                            self.config.get("api_port", self.default_config["api_port"])
+                        ),
+                    ).ask()
+
+                    # Add server_ready_timeout input
+                    server_ready_timeout_str = questionary.text(
+                        "Server Ready Timeout (seconds):",
+                        default=str(
+                            self.config.get(
+                                "server_ready_timeout",
+                                self.default_config["server_ready_timeout"],
+                            )
+                        ),
                     ).ask()
 
                     try:
                         api_port = int(api_port)
+                        # Add conversion for server_ready_timeout
+                        server_ready_timeout = int(server_ready_timeout_str)
+
                         self.config["api_host"] = api_host
                         self.config["api_port"] = api_port
+                        # Add saving for server_ready_timeout
+                        self.config["server_ready_timeout"] = server_ready_timeout
                         self.save_config()
                         console.print("[green]API server settings updated[/green]")
 
@@ -734,13 +757,18 @@ class LlamaServerCLI:
                                 # Update the server object with new settings
                                 self.api_server.host = api_host
                                 self.api_server.port = api_port
+                                # Add update for ready_timeout
+                                self.api_server.ready_timeout = server_ready_timeout
                                 self.api_server.start()
                                 console.print(
                                     "[green]API server restarted with new settings[/green]"
                                 )
                     except ValueError:
+                        # Update error message slightly
                         self._handle_error(
-                            "updating API settings", "Port must be a number", True
+                            "updating API settings",
+                            "Port and Timeout must be numbers",
+                            True,
                         )
                     time.sleep(1)
 
@@ -1148,11 +1176,13 @@ class APIServer:
         self.running = False
         # Use values from configuration or fallback to defaults
         self.host = self.cli.config.get("api_host", "0.0.0.0")
-        self.port = self.cli.config.get(
-            "api_port", 8000
-        )  # Default to port 8000 if not specified
+        self.port = self.cli.config.get("api_port", self.cli.default_config["api_port"])
+        # Load the readiness timeout using default_config as fallback
+        self.ready_timeout = self.cli.config.get(
+            "server_ready_timeout", self.cli.default_config["server_ready_timeout"]
+        )
         self.lock = threading.Lock()  # Add a lock for model switching
-        self.timeout = 30  # Timeout for server requests
+        self.timeout = 30  # Timeout for server requests (This is for the request *forwarding*, not readiness check)
 
     def setup_routes(self):
         self.router.add_api_route("/v1/models", self.list_models, methods=["GET"])
@@ -1286,6 +1316,7 @@ class APIServer:
                     )
 
                 # Wait for server to be ready (important after starting)
+                # Remove the argument here
                 if not self.wait_for_server_ready():
                     raise HTTPException(
                         503, f"Server startup timed out for profile '{model}'"
@@ -1576,11 +1607,13 @@ class APIServer:
                 console.print(f"[red]Unexpected error: {str(e)}[/red]")
                 raise HTTPException(500, f"Unexpected error: {str(e)}")
 
-    def wait_for_server_ready(self, timeout=30):
+    # Remove timeout parameter from signature
+    def wait_for_server_ready(self):
         """Wait for llama-server to be ready to accept requests"""
         start = time.time()
         console.print("[yellow]Waiting for server to be ready...[/yellow]")
-        while time.time() - start < timeout:
+        # Use the instance variable self.ready_timeout
+        while time.time() - start < self.ready_timeout:
             try:
                 # First check if the server process is still running
                 if (
@@ -1620,8 +1653,13 @@ class APIServer:
                         )
             except requests.RequestException as e:
                 console.print(f"[yellow]Waiting for server... ({str(e)})[/yellow]")
-            time.sleep(1)
-        self.cli._handle_error("waiting for server", "Server startup timed out", True)
+            time.sleep(1)  # Keep the 1-second sleep between checks
+        # Use self.ready_timeout in the error message
+        self.cli._handle_error(
+            "waiting for server",
+            f"Server startup timed out after {self.ready_timeout} seconds",
+            True,
+        )
         return False
 
     def start(self):
