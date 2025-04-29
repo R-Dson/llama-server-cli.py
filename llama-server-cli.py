@@ -118,6 +118,7 @@ class LlamaServerCLI:
             "continuous_batching": True,
             "api_host": "0.0.0.0",
             "api_port": 8000,
+            "inactivity_timeout": 300,
             "profiles": {"default": {}},
         }
         # Now load config which may use default_config
@@ -127,6 +128,13 @@ class LlamaServerCLI:
         # Create API server
         self.api_server = APIServer(self)
         self.api_thread = None
+        # Add state for inactivity tracking
+        self.last_activity_time = time.time()
+        self.activity_lock = threading.Lock()
+        self.inactivity_monitor_running = False
+        self.inactivity_monitor_thread = None
+        # Start the inactivity monitor
+        self.start_inactivity_monitor()
 
     def _output_reader(self, process, queue, handle_ending=True):
         """Common output reading function for process streams"""
@@ -448,6 +456,7 @@ class LlamaServerCLI:
                 "active_profile",
                 "api_host",
                 "api_port",
+                "inactivity_timeout",
                 "no-perf",
             ]
         )
@@ -549,6 +558,9 @@ class LlamaServerCLI:
                 bufsize=1,  # Line buffered
                 universal_newlines=True,
             )
+
+            # Reset inactivity timer on successful start
+            self.update_activity_time()
 
             # In background mode, start a thread to read output and put it in the queue
             if background and output_queue:
@@ -770,6 +782,7 @@ class LlamaServerCLI:
                         console.print(
                             "[green]Llama Server started in background mode[/green]"
                         )
+                        self.update_activity_time()
                     time.sleep(1)
 
                 elif choice == "Stop Llama Server":
@@ -787,6 +800,7 @@ class LlamaServerCLI:
                         console.print(
                             "[green]Llama Server restarted in background mode[/green]"
                         )
+                        self.update_activity_time()
                     time.sleep(1)
 
                 elif choice == "Start API Server":
@@ -859,6 +873,7 @@ class LlamaServerCLI:
                     "host",
                     "port",
                     "n_gpu_layers",
+                    "inactivity_timeout",
                     "flash_attn",
                     "mlock",
                     "no_mmap",
@@ -962,9 +977,10 @@ class LlamaServerCLI:
                         "batch_size",
                         "port",
                         "n_gpu_layers",
+                        "inactivity_timeout",
                     ]:
                         value = questionary.text(
-                            f"Enter value for {setting} (number):",
+                            f"Enter value for {setting} (number, 0 to disable):",  # Update prompt slightly
                             default=str(all_settings.get(setting, "")),
                         ).ask()
                     elif setting in [
@@ -1019,6 +1035,9 @@ class LlamaServerCLI:
                     universal_newlines=True,
                 )
 
+                # Reset inactivity timer on successful restart
+                self.update_activity_time()
+
                 # Set up background output reader
                 reader_thread = threading.Thread(
                     target=lambda: self._output_reader(
@@ -1032,6 +1051,91 @@ class LlamaServerCLI:
             except Exception:
                 return False
         return False
+
+    def update_activity_time(self):
+        """Reset the inactivity timer by updating the last activity time."""
+        with self.activity_lock:
+            self.last_activity_time = time.time()
+            # Optional: Log activity detection
+            # console.print("[dim]Activity detected, timer reset.[/dim]")
+
+    def start_inactivity_monitor(self):
+        """Start the background thread that monitors server inactivity."""
+        if (
+            not self.inactivity_monitor_thread
+            or not self.inactivity_monitor_thread.is_alive()
+        ):
+            self.inactivity_monitor_running = True
+            self.inactivity_monitor_thread = threading.Thread(
+                target=self._inactivity_monitor_loop
+            )
+            self.inactivity_monitor_thread.daemon = True  # Ensure it doesn't block exit
+            self.inactivity_monitor_thread.start()
+            # console.print("[dim]Inactivity monitor started.[/dim]")
+
+    def stop_inactivity_monitor(self):
+        """Signal the inactivity monitor thread to stop."""
+        self.inactivity_monitor_running = False
+        if self.inactivity_monitor_thread and self.inactivity_monitor_thread.is_alive():
+            # console.print("[dim]Stopping inactivity monitor...[/dim]")
+            self.inactivity_monitor_thread.join(
+                timeout=2
+            )  # Wait briefly for it to exit
+
+    def _inactivity_monitor_loop(self):
+        """Periodically checks for inactivity and stops the server if needed."""
+        while self.inactivity_monitor_running:
+            SLEEP_TIME = 10
+            try:
+                # Check if the server process is actually running
+                is_running = (
+                    self.llama_server_process
+                    and self.llama_server_process.poll() is None
+                )
+
+                if is_running:
+                    # Get the current timeout setting
+                    settings = self.get_active_settings()
+                    timeout = settings.get(
+                        "inactivity_timeout", 0
+                    )  # Default to 0 if not set
+
+                    # Proceed only if timeout is positive
+                    if timeout and timeout > 0:
+                        # Ensure timeout is treated as a number
+                        try:
+                            timeout_seconds = int(timeout)
+                            if timeout_seconds <= 0:
+                                # Skip check if timeout is zero or negative
+                                time.sleep(SLEEP_TIME)  # Still sleep before next check
+                                continue
+                        except (ValueError, TypeError):
+                            console.print(
+                                f"[red]Invalid inactivity_timeout value: {timeout}. Must be a number.[/red]"
+                            )
+                            # Use a default sleep or skip check? Let's skip check for this cycle.
+                            time.sleep(SLEEP_TIME)
+                            continue
+
+                        with self.activity_lock:
+                            idle_time = time.time() - self.last_activity_time
+
+                        if idle_time > timeout_seconds:
+                            console.print(
+                                f"[yellow]Server inactive for {idle_time:.0f}s (>{timeout_seconds}s timeout), stopping...[/yellow]"
+                            )
+                            self.stop_server()
+                            # No need to update last_activity_time here, server is stopped
+
+                # Sleep for a reasonable interval before checking again
+                # Only sleep if the monitor should still be running
+                if self.inactivity_monitor_running:
+                    time.sleep(SLEEP_TIME)  # Check every 30 seconds
+
+            except Exception as e:
+                # Log errors but keep the monitor running
+                console.print(f"[red]Error in inactivity monitor: {e}[/red]")
+                time.sleep(60)  # Wait longer after an error
 
 
 class APIServer:
@@ -1118,11 +1222,29 @@ class APIServer:
             raise HTTPException(404, "Profile not found")
 
         with self.lock:
-            current_profile = self.cli.config.get("active_profile", "default")
-            if model != current_profile:
+            # --- Start: Add check and auto-start logic ---
+            server_needs_start = False
+            if (
+                self.cli.llama_server_process is None
+                or self.cli.llama_server_process.poll() is not None
+            ):
                 console.print(
-                    f"[yellow]Switching from profile {current_profile} to {model}[/yellow]"
+                    f"[yellow]Llama server is stopped. Request for profile '{model}' requires starting it.[/yellow]"
                 )
+                server_needs_start = True
+            # --- End: Add check and auto-start logic ---
+
+            current_profile = self.cli.config.get("active_profile", "default")
+            profile_needs_switch = model != current_profile
+
+            # --- Modify condition: Start if needed OR switch if running but wrong profile ---
+            if server_needs_start or (profile_needs_switch and not server_needs_start):
+                # Stop server only if it's running and needs switching
+                if profile_needs_switch and not server_needs_start:
+                    console.print(
+                        f"[yellow]Switching from profile {current_profile} to {model}[/yellow]"
+                    )
+                # Removed extra parenthesis here
 
                 # First stop the current llama-server if it's running
                 if (
@@ -1144,31 +1266,50 @@ class APIServer:
                     finally:
                         self.cli.llama_server_process = None
 
-                # Update the active profile in config
+                # Update the active profile in config (do this whether starting or switching)
                 self.cli.config["active_profile"] = model
-                self.cli.save_config()
+                self.cli.save_config()  # Save immediately
 
-                # Start server with new profile
+                # Start server with the target profile
                 console.print(
                     f"[yellow]Starting server with profile {model}...[/yellow]"
                 )
+                # Use a temporary queue, its output isn't critical here
                 bg_queue = queue.Queue()
                 if not self.cli.start_server(
                     model, background=True, output_queue=bg_queue
                 ):
-                    raise HTTPException(500, "Failed to start server with new profile")
+                    # Restore previous profile if start fails? Maybe too complex.
+                    # For now, just report failure.
+                    raise HTTPException(
+                        500, f"Failed to start server with profile '{model}'"
+                    )
 
-                # Wait for server to be ready
+                # Wait for server to be ready (important after starting)
                 if not self.wait_for_server_ready():
-                    raise HTTPException(503, "Server startup timed out")
+                    raise HTTPException(
+                        503, f"Server startup timed out for profile '{model}'"
+                    )
+
+            # --- End: Modify condition ---
 
             # At this point, the correct server should be running
-            # Verify server is running before forwarding request
+            # Verify server is running before forwarding request (redundant check, but safe)
             if (
                 not self.cli.llama_server_process
                 or self.cli.llama_server_process.poll() is not None
             ):
-                raise HTTPException(503, "Llama server is not running")
+                # This should ideally not happen if wait_for_server_ready passed
+                console.print(
+                    "[red]Error: Server process check failed after startup/switch attempt.[/red]"
+                )
+                raise HTTPException(
+                    503, "Llama server is not running despite startup attempt"
+                )
+
+            # --- Add: Update activity time ---
+            self.cli.update_activity_time()
+            # --- End: Update activity time ---
 
             # Forward request to the running llama-server
             server_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
@@ -1338,7 +1479,10 @@ class APIServer:
                                 "[yellow]Client likely disconnected. Terminating stream gracefully.[/yellow]"
                             )
                             # Send a final message indicating the stream was interrupted
-                            yield f'data: {{"error": "Stream interrupted: {str(e).replace("'", "\\'")}", "finish_reason": "client_disconnected"}}\n\n'.encode(
+                            error_message = str(e).replace(
+                                "'", "\\'"
+                            )  # Escape single quotes for JSON
+                            yield f'data: {{"error": "Stream interrupted: {error_message}", "finish_reason": "client_disconnected"}}\n\n'.encode(
                                 "utf-8"
                             )
 
@@ -1830,6 +1974,9 @@ def main(ctx: typer.Context):
             if cli.api_server.running:
                 console.print("[yellow]Stopping API server...[/yellow]")
                 cli.api_server.stop()
+            # Stop the inactivity monitor
+            if cli.inactivity_monitor_running:
+                cli.stop_inactivity_monitor()
             if signum is not None:  # Only exit if called as signal handler
                 sys.exit(0)
 
@@ -1840,8 +1987,8 @@ def main(ctx: typer.Context):
         if ctx.invoked_subcommand is None:
             cli.interactive_config()
     finally:
-        # Always ensure servers are stopped when application exits
-        cleanup()
+        # Always ensure servers and monitor are stopped when application exits
+        cleanup()  # This already calls the modified cleanup
 
 
 # Function to find GGUF models in gguf directory and subdirectories
