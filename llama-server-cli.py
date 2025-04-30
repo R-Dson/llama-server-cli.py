@@ -27,70 +27,29 @@ from rich.table import Table
 
 # Main app
 app = typer.Typer(help="LLama Server CLI Tool")
-profile_app = typer.Typer(help="Profile management")
-server_app = typer.Typer(help="Server management")
-config_app = typer.Typer(help="Interactive configuration")
-api_app = typer.Typer(help="API server management")
-app.add_typer(profile_app, name="profile")
-app.add_typer(server_app, name="server")
-app.add_typer(config_app, name="config")
-app.add_typer(api_app, name="api")
 
 # Rich console for pretty output
 console = Console()
 
 
 def numbered_choice(message, choices):
-    """
-    Display a menu with numbered choices using questionary with number key shortcuts
-    """
-    # Add numbers only to the first 9 choices for display
-    numbered_choices = []
-    for i, choice in enumerate(choices):
-        if i < 9:  # Only first 9 choices get number prefixes
-            numbered_choices.append(f"{i + 1}. {choice}")
-        else:
-            # For options beyond 9, don't show a number prefix
-            numbered_choices.append(f"   {choice}")
-    numbered_choices = choices
-    # Display the menu with custom instruction
+    """Display a menu with choices using questionary"""
     console.print(f"\n[cyan]{message}[/cyan]")
-    console.print(
-        "[dim](Use arrow keys to navigate or press number keys 1-9 to select)[/dim]"
-    )
-
+    
     try:
-        # Use questionary's built-in shortcut support
         selected = questionary.select(
-            "",  # Empty prompt since we already printed one
-            choices=numbered_choices,
+            "",
+            choices=choices,
             qmark="",
-            use_shortcuts=True,  # Enable shortcut keys
-            use_indicator=True,
-            style=questionary.Style(
-                [
-                    ("selected", "bg:#268bd2 #ffffff"),
-                    ("highlighted", "bg:#268bd2 #ffffff"),
-                ]
-            ),
+            use_shortcuts=True,
+            style=questionary.Style([
+                ("selected", "bg:#268bd2 #ffffff"),
+            ]),
         ).ask()
+        return selected
     except Exception as e:
         console.print(f"[red]Menu error: {e}[/red]")
         return None
-
-    # If selection was made, extract the actual choice
-    if selected:
-        # For options with number prefixes (1-9), remove the prefix
-        if selected.startswith(tuple("123456789")):
-            # Find the first dot+space and extract everything after it
-            idx = selected.find(". ")
-            if idx >= 0:
-                return selected[idx + 2 :]
-        else:
-            # For options beyond 9, just remove the leading spaces
-            return selected.strip()
-
-    return None
 
 
 class LlamaServerCLI:
@@ -346,138 +305,99 @@ class LlamaServerCLI:
         ):
             self.restart_server_seamless(active_profile)
 
-    def _get_setting(self, profile_name, key, default=None):
-        """Safely get setting value with fallback to default profile or global default"""
-        # Get the profile settings
-        profiles = self.config.get("profiles", {})
-        profile = profiles.get(profile_name, {})
-
-        # First try profile-specific setting
-        if key in profile:
-            return profile[key]
-
-        # Then try global setting
-        if key in self.config:
-            return self.config[key]
-
-        # Finally fallback to provided default
-        return default
-
     def get_active_settings(self, profile_name: Optional[str] = None) -> Dict:
         """Get active settings with proper precedence: profile > global > defaults"""
+        # Use provided profile or active profile
         if profile_name is None:
             profile_name = self.config.get("active_profile", "default")
-
-        # Start with default configuration
+        
+        # Start with defaults
         settings = self.default_config.copy()
-
-        # Apply global configuration over defaults
-        settings.update(
-            {
-                k: v
-                for k, v in self.config.items()
-                if k != "profiles" and k != "active_profile"
-            }
-        )
-
-        # Apply profile-specific settings (highest priority)
-        profile_settings = self.config.get("profiles", {}).get(profile_name, {})
-        settings.update(profile_settings)
-
+        
+        # Apply global settings (excluding profiles and active_profile)
+        for key, value in self.config.items():
+            if key not in ["profiles", "active_profile"]:
+                settings[key] = value
+        
+        # Apply profile-specific settings
+        profile = self.config.get("profiles", {}).get(profile_name, {})
+        for key, value in profile.items():
+            settings[key] = value
+        
         return settings
 
     def build_llama_args(self, profile_name: Optional[str] = None) -> List[str]:
         """Build command line arguments for llama-server based on active settings"""
         settings = self.get_active_settings(profile_name)
-
         args = ["./llama-server"]
 
-        # Model is required
+        # Check for required model parameter
         if not settings.get("model"):
-            self._handle_error(
-                "building args", "No model specified in configuration", True
-            )
+            console.print("[red]Error: No model specified in configuration[/red]")
             return []
-
         args.extend(["-m", settings["model"]])
 
-        # --- Settings with Values ---
-        # Map setting names to their command line args and conversion functions
-        value_args = {
-            "threads": ("-t", str),
-            "temp": ("--temp", str),
-            "top_k": ("--top-k", str),
-            "top_p": ("--top-p", str),
-            "batch_size": ("-b", str),
-            "host": ("--host", str),
-            "port": ("--port", str),
-            "n_predict": ("-n", str),
-            "mirostat": ("--mirostat", str),
-            "mirostat_eta": ("--mirostat-eta", str),
-            "mirostat_tau": ("--mirostat-tau", str),
-            "repeat_penalty": ("--repeat-penalty", str),
-            "n_gpu_layers": ("-ngl", str),
-            "seed": ("-s", str),
-            "ctx_size": ("-c", str),
-        }
-
-        # Add all parameters with values
-        for key, (arg, converter) in value_args.items():
+        # Add numeric parameters
+        for key in ["threads", "temp", "top_k", "top_p", "batch_size", "n_predict",
+                    "n_gpu_layers", "seed", "ctx_size", "mirostat", "mirostat_eta",
+                    "mirostat_tau", "repeat_penalty"]:
             if key in settings and settings[key] is not None:
-                args.extend([arg, converter(settings[key])])
+                # Convert key to command format (e.g., "n_gpu_layers" → "-ngl")
+                if key == "threads":
+                    cmd_key = "-t"
+                elif key == "batch_size":
+                    cmd_key = "-b"
+                elif key == "n_predict":
+                    cmd_key = "-n"
+                elif key == "n_gpu_layers":
+                    cmd_key = "-ngl"
+                elif key == "seed":
+                    cmd_key = "-s"
+                elif key == "ctx_size":
+                    cmd_key = "-c"
+                else:
+                    cmd_key = f"--{key.replace('_', '-')}"
+                
+                args.extend([cmd_key, str(settings[key])])
 
-        # Handle boolean flags
-        bool_flags = {
-            "ignore_eos": "--ignore-eos",
-            "no_mmap": "--no-mmap",
-            "mlock": "--mlock",
-            "embedding": "--embedding",
-            "flash_attn": "--flash-attn",
-            "continuous_batching": "--cont-batching",
-        }
+        # Add string parameters
+        for key in ["host", "port"]:
+            if key in settings and settings[key] is not None:
+                args.extend([f"--{key}", str(settings[key])])
 
-        # Add boolean flags if set to True
-        for key, arg in bool_flags.items():
+        # Add boolean flags
+        for key in ["ignore_eos", "no_mmap", "mlock", "embedding", 
+                    "flash_attn", "no-perf"]:
             if settings.get(key, False):
-                args.append(arg)
+                args.append(f"--{key.replace('_', '-')}")
 
-        # Special case for no_continuous_batching (inverse of continuous_batching)
-        if settings.get("continuous_batching") is False:
+        # Special case for continuous batching
+        if settings.get("continuous_batching", True):
+            args.append("--cont-batching")
+        else:
             args.append("--no-cont-batching")
 
-        # Handle custom parameters not defined in the predefined lists
-        predefined_keys = (
-            list(value_args.keys())
-            + list(bool_flags.keys())
-            + [
-                "model",
-                "continuous_batching",
-                "profiles",
-                "active_profile",
-                "api_host",
-                "api_port",
-                "inactivity_timeout",
-                "server_ready_timeout",  # Add this key here
-                "no-perf",
-            ]
-        )
-
-        # Process any custom parameters
+        # Add any custom parameters not already handled
         for key, value in settings.items():
-            if key not in predefined_keys and value is not None:
-                # Check if the key already has dashes
-                if "-" in key:
-                    cmd_key = f"--{key}"
-                else:
-                    # Convert snake_case to command line format with dashes
+            if key not in ["model", "threads", "temp", "top_k", "top_p", "batch_size", 
+                          "n_predict", "host", "port", "n_gpu_layers", "seed", "ctx_size",
+                          "mirostat", "mirostat_eta", "mirostat_tau", "repeat_penalty",
+                          "ignore_eos", "no_mmap", "mlock", "embedding", "flash_attn",
+                          "continuous_batching", "profiles", "active_profile", 
+                          "api_host", "api_port", "inactivity_timeout", 
+                          "server_ready_timeout", "no-perf"] and value is not None:
+            
+                # Format the parameter name with dashes
+                if "-" not in key:
                     cmd_key = f"--{key.replace('_', '-')}"
-
-                # Handle boolean values specially
+                else:
+                    cmd_key = f"--{key}"
+                
+                # Add as flag or key-value pair based on type
                 if isinstance(value, bool):
-                    if value:  # Only add the flag if True
+                    if value:
                         args.append(cmd_key)
                 else:
-                    # For non-boolean values, add as key-value pair
                     args.extend([cmd_key, str(value)])
 
         return args
@@ -489,119 +409,66 @@ class LlamaServerCLI:
         output_queue: Optional[queue.Queue] = None,
     ) -> bool:
         """Start the llama-server with the specified profile"""
-        # Get settings to validate before starting
+        # Get settings for the selected profile
         settings = self.get_active_settings(profile_name)
-
-        # Validate essential settings
-        validation_errors = []
-
-        # Check for model (most critical setting)
+        
+        # Validate model path - most critical setting
         if not settings.get("model"):
-            validation_errors.append(
-                "[bold red]ERROR:[/bold red] No model specified in configuration"
-            )
-        elif not os.path.exists(settings["model"]):
-            validation_errors.append(
-                f"[bold red]ERROR:[/bold red] Model file not found: {settings['model']}"
-            )
-
-        # Check for other important settings
-        if "ctx_size" in settings and (
-            not isinstance(settings["ctx_size"], int) or settings["ctx_size"] <= 0
-        ):
-            validation_errors.append(
-                f"[bold yellow]WARNING:[/bold yellow] Invalid context size: {settings['ctx_size']}"
-            )
-
-        if "threads" in settings and not isinstance(settings["threads"], int):
-            validation_errors.append(
-                f"[bold yellow]WARNING:[/bold yellow] Invalid thread count: {settings['threads']}"
-            )
-
-        # Display validation errors
-        if validation_errors:
-            console.clear()  # Clear screen first to make error message prominent
-            console.print(
-                "\n[red]Cannot start server due to configuration issues:[/red]"
-            )
-            for error in validation_errors:
-                console.print(f"  {error}")
-
-            # Suggest next steps
-            console.print("\n[cyan]What to do next:[/cyan]")
-            console.print("  1. Edit your profile settings to fix these issues")
-            console.print(
-                f"  2. Set a model path with: ./llama-server-cli.py profile set {profile_name or settings.get('active_profile', 'default')} model /path/to/model.gguf"
-            )
-            console.print("  3. Or choose a different profile with valid settings")
-
-            # Wait for user acknowledgment before returning to menu
-            if not background:
-                console.print("\n[yellow]Press Enter to return to the menu...[/yellow]")
-                input()
+            console.print("[red]ERROR: No model specified in configuration[/red]")
             return False
-
+        if not os.path.exists(settings["model"]):
+            console.print(f"[red]ERROR: Model file not found: {settings['model']}[/red]")
+            return False
+        
+        # Build command arguments
         args = self.build_llama_args(profile_name)
         if not args:
             return False
-
-        console.print(
-            f"[green]Starting llama-server with command:[/green] {' '.join(args)}"
-        )
-
+        
+        console.print(f"[green]Starting llama-server with command:[/green] {' '.join(args)}")
+        
         try:
-            # Use Popen to keep a reference to the process
+            # Start the process
             self.llama_server_process = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,  # Line buffered
+                bufsize=1,
                 universal_newlines=True,
             )
-
-            # In background mode, start a thread to read output and put it in the queue
+            
+            # In background mode, start a thread to read output
             if background and output_queue:
                 reader_thread = threading.Thread(
-                    target=lambda: self._output_reader(
-                        self.llama_server_process, output_queue
-                    )
+                    target=lambda: self._output_reader(self.llama_server_process, output_queue)
                 )
-                reader_thread.daemon = (
-                    True  # Make thread daemon so it doesn't block program exit
-                )
+                reader_thread.daemon = True
                 reader_thread.start()
-
+                
                 # Start inactivity monitor
                 self.start_inactivity_monitor()
-                
                 return True
-
-            # In foreground mode, print the output directly
+                
+            # In foreground mode, print output directly
             else:
-                # Print server output with rich
-                with console.status(
-                    "[bold green]Server started. Press Ctrl+C to stop."
-                ) as status:
-                    console.print(
-                        "[bold green]Server started. Press Ctrl+C to stop.[/bold green]"
-                    )
+                with console.status("[bold green]Server started. Press Ctrl+C to stop.") as status:
+                    console.print("[bold green]Server started. Press Ctrl+C to stop.[/bold green]")
                     while self.llama_server_process.poll() is None:
                         line = self.llama_server_process.stdout.readline()
                         if line:
                             console.print(line.rstrip())
-
+                            
                 # Check exit code
-                exit_code = self.llama_server_process.returncode
-                if exit_code != 0:
-                    console.print(f"[red]Server exited with code {exit_code}[/red]")
-
+                if self.llama_server_process.returncode != 0:
+                    console.print(f"[red]Server exited with code {self.llama_server_process.returncode}[/red]")
+                    
         except Exception as e:
             console.print(f"[red]Error starting server: {e}[/red]")
             if self.llama_server_process:
                 self.stop_server()
             return False
-
+        
         return True
 
     def stop_server(self) -> None:
@@ -705,9 +572,17 @@ class LlamaServerCLI:
                 console.print(f"\n[bold]Llama Server Status:[/bold] {llama_status}")
                 console.print(f"[bold]API Server Status:[/bold] {api_status}")
 
-                # Get or select active profile
+                # Get active profile
                 active_profile = self.config.get("active_profile", "default")
                 profiles = list(self.config.get("profiles", {}).keys())
+                
+                # If server is running, show its output
+                if self.llama_server_process and self.llama_server_process.poll() is None:
+                    server_output = self.server_monitor.get_output()
+                    if server_output:
+                        console.print("\n[bold]Server Output:[/bold]")
+                        for line in server_output[-5:]:  # Show last 5 lines
+                            console.print(line)
 
                 # Display current profile info
                 self.show_profile(active_profile)
@@ -854,11 +729,7 @@ class LlamaServerCLI:
 
                 elif choice == "Start Llama Server":
                     console.clear()
-                    bg_queue = queue.Queue()
-                    start_success = self.start_server(
-                        active_profile, background=True, output_queue=bg_queue
-                    )
-                    if start_success:
+                    if self.server_monitor.start(active_profile):
                         console.print(
                             "[green]Llama Server started in background mode[/green]"
                         )
@@ -866,16 +737,13 @@ class LlamaServerCLI:
 
                 elif choice == "Stop Llama Server":
                     self.stop_server()
+                    self.server_monitor.stop()
                     time.sleep(1)
 
                 elif choice == "Restart Llama Server":
                     self.stop_server()
                     time.sleep(1)
-                    bg_queue = queue.Queue()
-                    start_success = self.start_server(
-                        active_profile, background=True, output_queue=bg_queue
-                    )
-                    if start_success:
+                    if self.server_monitor.start(active_profile):
                         console.print(
                             "[green]Llama Server restarted in background mode[/green]"
                         )
@@ -1795,45 +1663,40 @@ class APIServer:
 
 
 class ServerMonitor:
-    """Class to monitor a running llama-server and handle live updates"""
+    """Simple monitor for capturing server output to a queue"""
 
     def __init__(self, cli):
         self.cli = cli
         self.output_queue = queue.Queue()
         self.running = False
         self.monitor_thread = None
-        self.current_profile = None
-        self.current_settings = {}
         self.server_output = []
         self.max_log_lines = 20  # Maximum number of log lines to display
 
-    def start_monitoring(self, profile_name: str) -> None:
-        """Start monitoring the server with the specified profile"""
-        if self.running:
-            console.print(
-                "[yellow]Server is already running and being monitored[/yellow]"
-            )
-            return
-
-        self.current_profile = profile_name
-        self.current_settings = self.cli.get_active_settings(profile_name)
-
+    def start(self, profile_name: str) -> bool:
+        """Start server with the specified profile and capture output"""
         # Start the server
         success = self.cli.start_server(
             profile_name, background=True, output_queue=self.output_queue
         )
         if not success:
-            return
+            return False
 
         self.running = True
+        self.server_output = []  # Clear previous output
 
         # Start the monitoring thread
         self.monitor_thread = threading.Thread(target=self._monitor_loop)
         self.monitor_thread.daemon = True
         self.monitor_thread.start()
+        
+        return True
 
-        # Enter monitoring UI
-        self._monitoring_ui()
+    def stop(self) -> None:
+        """Stop monitoring (but not the server)"""
+        self.running = False
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=2)
 
     def _monitor_loop(self) -> None:
         """Background thread to monitor server output"""
@@ -1842,12 +1705,8 @@ class ServerMonitor:
                 # Check if server is still running
                 if self.cli.llama_server_process.poll() is not None:
                     self.running = False
-                    self.output_queue.put(
-                        (
-                            "STATUS",
-                            "Server stopped with exit code "
-                            + str(self.cli.llama_server_process.returncode),
-                        )
+                    self.server_output.append(
+                        f"[yellow]Server stopped with code {self.cli.llama_server_process.returncode}[/yellow]"
                     )
                     break
 
@@ -1863,7 +1722,7 @@ class ServerMonitor:
 
                     # Trim log to max lines
                     if len(self.server_output) > self.max_log_lines:
-                        self.server_output = self.server_output[-self.max_log_lines :]
+                        self.server_output = self.server_output[-self.max_log_lines:]
 
                     self.output_queue.task_done()
                 except queue.Empty:
@@ -1873,147 +1732,42 @@ class ServerMonitor:
                 self.server_output.append(f"[red]Monitor error: {e}[/red]")
 
             time.sleep(0.1)
-
-    def _monitoring_ui(self) -> None:
-        """Interactive UI for monitoring the server"""
-        try:
-            while self.running:
-                console.clear()
-
-                # Display current status
-                if (
-                    self.cli.llama_server_process
-                    and self.cli.llama_server_process.poll() is None
-                ):
-                    status_text = f"[green]Server running with profile: {self.current_profile}[/green]"
-                else:
-                    status_text = "[red]Server stopped[/red]"
-
-                rprint(
-                    Panel.fit(
-                        f"Llama Server Monitor - {status_text}", style="bold cyan"
-                    )
-                )
-
-                # Show last X lines of output
-                console.print("[bold]Server Output:[/bold]")
-                for line in self.server_output:
-                    console.print(line)
-
-                # Menu options
-                console.print("\n[bold]Options:[/bold]")
-                options = [
-                    "Edit settings and restart server",
-                    "Restart server with current settings",
-                    "Stop server and return to main menu",
-                    "View current settings",
-                ]
-
-                choice = numbered_choice("What would you like to do?", options)
-
-                if choice == "Edit settings and restart server":
-                    # Stop the server
-                    if (
-                        self.cli.llama_server_process
-                        and self.cli.llama_server_process.poll() is None
-                    ):
-                        self.cli.stop_server()
-                        self.running = False
-                        time.sleep(1)  # Give the server time to stop
-
-                    # Edit settings
-                    self.cli._interactive_edit_profile(self.current_profile)
-
-                    # Restart the server and monitoring
-                    self.start_monitoring(self.current_profile)
-                    return
-
-                elif choice == "Stop server and return to main menu":
-                    if (
-                        self.cli.llama_server_process
-                        and self.cli.llama_server_process.poll() is None
-                    ):
-                        self.cli.stop_server()
-                    self.running = False
-                    return
-
-                elif choice == "Restart server with current settings":
-                    # Stop the server
-                    if (
-                        self.cli.llama_server_process
-                        and self.cli.llama_server_process.poll() is None
-                    ):
-                        self.cli.stop_server()
-                        time.sleep(1)  # Give the server time to stop
-
-                    # Restart it
-                    success = self.cli.start_server(
-                        self.current_profile,
-                        background=True,
-                        output_queue=self.output_queue,
-                    )
-                    if success:
-                        self.running = True
-                        self.server_output.append("[green]Server restarted[/green]")
-
-                elif choice == "View current settings":
-                    console.clear()
-                    self.cli.show_profile(self.current_profile)
-                    console.print("\n[yellow]Press Enter to continue...[/yellow]")
-                    input()
-
-        except KeyboardInterrupt:
-            # Handle Ctrl+C
-            console.print("[yellow]Stopping monitoring...[/yellow]")
-            self.running = False
-            if (
-                self.cli.llama_server_process
-                and self.cli.llama_server_process.poll() is None
-            ):
-                self.cli.stop_server()
-
-        finally:
-            # Make sure the server is properly cleaned up
-            self.running = False
-            if self.monitor_thread and self.monitor_thread.is_alive():
-                self.monitor_thread.join(timeout=2)
+            
+    def get_output(self) -> List[str]:
+        """Get the current server output logs"""
+        return self.server_output.copy()
 
 
 # Create singleton instance
 cli = LlamaServerCLI()
 
 
-@profile_app.command("list")
+@app.command("list-profiles")
 def list_profiles():
     """List all available profiles"""
     cli.list_profiles()
 
-
-@profile_app.command("show")
+@app.command("show-profile")
 def show_profile(name: str = typer.Argument(..., help="Profile name")):
     """Show details of a specific profile"""
     cli.show_profile(name)
 
-
-@profile_app.command("create")
+@app.command("create-profile")
 def create_profile(name: str = typer.Argument(..., help="Profile name")):
     """Create a new profile"""
     cli.create_profile(name)
 
-
-@profile_app.command("delete")
+@app.command("delete-profile")
 def delete_profile(name: str = typer.Argument(..., help="Profile name")):
     """Delete an existing profile"""
     cli.delete_profile(name)
 
-
-@profile_app.command("use")
+@app.command("use-profile")
 def set_active_profile(name: str = typer.Argument(..., help="Profile name")):
     """Set active profile"""
     cli.set_active_profile(name)
 
-
-@profile_app.command("set")
+@app.command("set-setting")
 def set_setting(
     profile: str = typer.Argument(..., help="Profile name"),
     key: str = typer.Argument(..., help="Setting key"),
@@ -2022,8 +1776,7 @@ def set_setting(
     """Set a profile setting"""
     cli.set_setting(profile, key, value)
 
-
-@profile_app.command("clear")
+@app.command("clear-setting")
 def clear_setting(
     profile: str = typer.Argument(..., help="Profile name"),
     key: str = typer.Argument(..., help="Setting key"),
@@ -2031,28 +1784,24 @@ def clear_setting(
     """Clear a profile setting"""
     cli.clear_setting(profile, key)
 
-
-@server_app.command("start")
+@app.command("start-server")
 def start_server(
     profile: Optional[str] = typer.Option(None, help="Profile name to use"),
 ):
     """Start the server with specified profile (or active profile if none specified)"""
     cli.start_server(profile)
 
-
-@server_app.command("stop")
+@app.command("stop-server")
 def stop_server():
     """Stop the running server"""
     cli.stop_server()
 
-
-@config_app.command("interactive")
+@app.command("config")
 def interactive_config():
     """Start interactive configuration mode"""
     cli.interactive_config()
 
-
-@api_app.command("start")
+@app.command("start-api")
 def start_api_server():
     """Start the OpenAI-compatible API server"""
     cli.api_server.start()
@@ -2071,8 +1820,7 @@ def start_api_server():
         cli.api_server.stop()
         console.print("\n[green]API server stopped[/green]")
 
-
-@api_app.command("stop")
+@app.command("stop-api")
 def stop_api_server():
     """Stop the OpenAI-compatible API server"""
     if cli.api_server.running:
@@ -2081,78 +1829,19 @@ def stop_api_server():
     else:
         console.print("[yellow]API server is not running[/yellow]")
 
-
-@api_app.command("reset")
+@app.command("reset-api")
 def reset_api_counters():
-    """Reset all API request counters and enable server shutdown
-    
-    Use this command if the server is stuck and won't shut down automatically.
-    """
+    """Reset all API request counters and enable server shutdown"""
     if cli.api_server.running:
         cli.api_server.reset_counters()
-        console.print("[green]API counters reset, server shutdown is now enabled[/green]")
+        console.print("[green]API counters reset, server shutdown enabled[/green]")
     else:
         console.print("[yellow]API server is not running[/yellow]")
 
-
-@app.callback(invoke_without_command=True)
-def main(ctx: typer.Context):
-    """LLama Server CLI Tool"""
-    try:
-        # Set up signal handlers at program level
-        def cleanup(signum=None, frame=None):
-            if cli.llama_server_process and cli.llama_server_process.poll() is None:
-                console.print("[yellow]Stopping server before exit...[/yellow]")
-                cli.stop_server()
-            if cli.api_server.running:
-                console.print("[yellow]Stopping API server...[/yellow]")
-                cli.api_server.stop()
-
-        signal.signal(signal.SIGINT, cleanup)
-        signal.signal(signal.SIGTERM, cleanup)
-
-        # If no subcommand is provided, launch interactive mode
-        if ctx.invoked_subcommand is None:
-            cli.interactive_config()
-    finally:
-        # Always ensure servers and monitor are stopped when application exits
-        cleanup()  # This already calls the modified cleanup
-
-
-# Function to find GGUF models in gguf directory and subdirectories
-def find_gguf_models() -> List[str]:
-    """Find all GGUF model files in the gguf directory and subdirectories"""
-    # Check if gguf directory exists, create it if it doesn't
-    if not os.path.exists("gguf"):
-        os.makedirs("gguf")
-        console.print("[yellow]Created gguf directory for models[/yellow]")
-        return []
-
-    # Find all .gguf files in the gguf directory and subdirectories
-    models = []
-    for root, _, files in os.walk("gguf"):
-        for file in files:
-            if file.endswith(".gguf"):
-                model_path = os.path.join(root, file)
-                models.append(model_path)
-
-    # Also look for .gguf files in the current directory
-    for file in glob.glob("*.gguf"):
-        models.append(file)
-
-    # Sort models by name
-    models.sort()
-
-    return models
-
-
-@server_app.command("monitor")
+@app.command("restart-monitor")
 def restart_inactivity_monitor():
-    """Restart the inactivity monitor for the currently running server
-    
-    Use this if the server is running but the inactivity monitor has stopped.
-    """
-    # First check if server is running but monitor is not
+    """Restart the inactivity monitor for the currently running server"""
+    # Check if server is running but monitor is not
     server_running = False
     monitor_running = False
     
@@ -2229,6 +1918,52 @@ def restart_inactivity_monitor():
     # Start monitor
     cli.start_inactivity_monitor()
     console.print("[green]Inactivity monitor restarted successfully[/green]")
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context):
+    """LLama Server CLI Tool"""
+    try:
+        # Set up signal handlers at program level
+        def cleanup(signum=None, frame=None):
+            if cli.llama_server_process and cli.llama_server_process.poll() is None:
+                console.print("[yellow]Stopping server before exit...[/yellow]")
+                cli.stop_server()
+            if cli.api_server.running:
+                console.print("[yellow]Stopping API server...[/yellow]")
+                cli.api_server.stop()
+
+        signal.signal(signal.SIGINT, cleanup)
+        signal.signal(signal.SIGTERM, cleanup)
+
+        # If no subcommand is provided, launch interactive mode
+        if ctx.invoked_subcommand is None:
+            cli.interactive_config()
+    finally:
+        # Always ensure servers and monitor are stopped when application exits
+        cleanup()  # This already calls the modified cleanup
+
+
+# Function to find GGUF models in gguf directory and subdirectories
+def find_gguf_models() -> List[str]:
+    """Find all GGUF model files in the current directory and gguf subdirectory"""
+    models = []
+    
+    # Create gguf directory if it doesn't exist
+    if not os.path.exists("gguf"):
+        os.makedirs("gguf")
+        console.print("[yellow]Created gguf directory for models[/yellow]")
+    
+    # Search in current directory
+    models.extend(glob.glob("*.gguf"))
+    
+    # Search in gguf directory and its subdirectories
+    models.extend(glob.glob("gguf/**/*.gguf", recursive=True))
+    
+    # Sort models alphabetically
+    models.sort()
+    
+    return models
 
 
 if __name__ == "__main__":
