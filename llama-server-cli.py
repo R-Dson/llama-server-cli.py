@@ -336,31 +336,7 @@ class LlamaServerCLI:
         if not settings.get("model"):
             console.print("[red]Error: No model specified in configuration[/red]")
             return []
-        args.extend(["-m", settings["model"]])
-
-        # Add numeric parameters
-        for key in ["threads", "temp", "top_k", "top_p", "batch_size", "n_predict",
-                    "n_gpu_layers", "seed", "ctx_size", "mirostat", "mirostat_eta",
-                    "mirostat_tau", "repeat_penalty"]:
-            if key in settings and settings[key] is not None:
-                # Convert key to command format (e.g., "n_gpu_layers" → "-ngl")
-                if key == "threads":
-                    cmd_key = "-t"
-                elif key == "batch_size":
-                    cmd_key = "-b"
-                elif key == "n_predict":
-                    cmd_key = "-n"
-                elif key == "n_gpu_layers":
-                    cmd_key = "-ngl"
-                elif key == "seed":
-                    cmd_key = "-s"
-                elif key == "ctx_size":
-                    cmd_key = "-c"
-                else:
-                    cmd_key = f"--{key.replace('_', '-')}"
-                
-                args.extend([cmd_key, str(settings[key])])
-
+        
         # Add string parameters
         for key in ["host", "port"]:
             if key in settings and settings[key] is not None:
@@ -377,23 +353,25 @@ class LlamaServerCLI:
             args.append("--cont-batching")
         else:
             args.append("--no-cont-batching")
+            
+        excluded_keys = [
+            "continuous_batching",
+            # Exclude CLI/API server specific settings
+            "profiles", "active_profile",
+            "api_host", "api_port", "inactivity_timeout",
+            "server_ready_timeout", "stream_watchdog_timeout"
+        ]
 
         # Add any custom parameters not already handled
         for key, value in settings.items():
-            if key not in ["model", "threads", "temp", "top_k", "top_p", "batch_size", 
-                          "n_predict", "host", "port", "n_gpu_layers", "seed", "ctx_size",
-                          "mirostat", "mirostat_eta", "mirostat_tau", "repeat_penalty",
-                          "ignore_eos", "no_mmap", "mlock", "embedding", "flash_attn",
-                          "continuous_batching", "profiles", "active_profile", 
-                          "api_host", "api_port", "inactivity_timeout", 
-                          "server_ready_timeout", "no-perf"] and value is not None:
-            
+            if key not in excluded_keys and value is not None:
+
                 # Format the parameter name with dashes
                 if "-" not in key:
                     cmd_key = f"--{key.replace('_', '-')}"
                 else:
                     cmd_key = f"--{key}"
-                
+
                 # Add as flag or key-value pair based on type
                 if isinstance(value, bool):
                     if value:
