@@ -83,8 +83,9 @@ class LlamaServerCLI:
             "continuous_batching": True,
             "api_host": "0.0.0.0",
             "api_port": 8000,
-            "inactivity_timeout": 300,
-            "server_ready_timeout": 60,
+            "inactivity_timeout": 300, # how long the entire server stays alive without any new requests
+            "server_ready_timeout": 60, 
+            "stream_watchdog_timeout": 600, # how long a single streaming response can maximum take
             "profiles": {"default": {}},
         }
         
@@ -661,16 +662,31 @@ class LlamaServerCLI:
                             )
                         ),
                     ).ask()
+                    
+                    # Add stream_watchdog_timeout input
+                    stream_watchdog_timeout_str = questionary.text(
+                        "Stream Watchdog Timeout (seconds):",
+                        default=str(
+                            self.config.get(
+                                "stream_watchdog_timeout",
+                                self.default_config["stream_watchdog_timeout"],
+                            )
+                        ),
+                    ).ask()
 
                     try:
                         api_port = int(api_port)
                         # Add conversion for server_ready_timeout
                         server_ready_timeout = int(server_ready_timeout_str)
+                        # Add conversion for stream_watchdog_timeout
+                        stream_watchdog_timeout = int(stream_watchdog_timeout_str)
 
                         self.config["api_host"] = api_host
                         self.config["api_port"] = api_port
                         # Add saving for server_ready_timeout
                         self.config["server_ready_timeout"] = server_ready_timeout
+                        # Add saving for stream_watchdog_timeout
+                        self.config["stream_watchdog_timeout"] = stream_watchdog_timeout
                         self.save_config()
                         console.print("[green]API server settings updated[/green]")
 
@@ -686,6 +702,8 @@ class LlamaServerCLI:
                                 self.api_server.port = api_port
                                 # Add update for ready_timeout
                                 self.api_server.ready_timeout = server_ready_timeout
+                                # Add update for stream_watchdog_timeout
+                                self.api_server.stream_watchdog_timeout = stream_watchdog_timeout
                                 self.api_server.start()
                                 console.print(
                                     "[green]API server restarted with new settings[/green]"
@@ -694,7 +712,7 @@ class LlamaServerCLI:
                         # Update error message slightly
                         self._handle_error(
                             "updating API settings",
-                            "Port and Timeout must be numbers",
+                            "Port and Timeout values must be numbers",
                             True,
                         )
                     time.sleep(1)
@@ -953,11 +971,20 @@ class LlamaServerCLI:
     
     def update_activity_timestamp(self):
         """Update the last activity timestamp to prevent server shutdown"""
+        previous_state = self.can_kill
         self.last_activity_timestamp = time.time()
         self.can_kill = False
-    
+        
+        # Log the state change for debugging
+        # if previous_state != self.can_kill:
+        #     console.print(f"[dim]Inactivity monitor: Setting can_kill from {previous_state} to {self.can_kill}[/dim]")
+
     def _inactivity_monitor_loop(self):
         """Monitor inactivity and shut down server when idle for too long"""
+        
+        # Add a counter for periodic logging
+        #log_counter = 0
+        
         while True:
             try:
                 # Exit if server is not running
@@ -968,24 +995,35 @@ class LlamaServerCLI:
                 timeout_seconds = self.config.get("inactivity_timeout", self.default_config["inactivity_timeout"])
                 
                 # Calculate time since last activity
-                idle_time = time.time() - self.last_activity_timestamp
+                current_time = time.time()
+                idle_time = current_time - self.last_activity_timestamp
                 
                 # Check if API server has active requests
                 api_is_active = False
+                api_request_count = 0
+                api_stream_count = 0
+                
                 if hasattr(self, 'api_server') and self.api_server.running:
-                    if self.api_server.active_requests > 0 or self.api_server.active_streams > 0:
+                    with self.api_server.active_requests_lock:
+                        api_request_count = self.api_server.active_requests
+                    with self.api_server.active_streams_lock:
+                        api_stream_count = self.api_server.active_streams
+                        
+                    if api_request_count > 0 or api_stream_count > 0:
                         api_is_active = True
-                        self.last_activity_timestamp = time.time()
+                        self.last_activity_timestamp = current_time
                 
                 # If we've been idle for longer than the timeout and we're allowed to kill
                 if idle_time >= timeout_seconds and self.can_kill and not api_is_active:
                     console.print(f"[yellow]Server idle for {int(idle_time)} seconds, shutting down...[/yellow]")
+                    # console.print(f"[yellow]Debug info: can_kill={self.can_kill}, api_active={api_is_active}[/yellow]")
                     self.stop_server()
                     break
                 
                 # Force shutdown after 3x timeout period regardless of state
                 elif idle_time >= (timeout_seconds * 3):
                     console.print(f"[red]Server idle for {int(idle_time)} seconds (3x timeout)! Forcing shutdown...[/red]")
+                    # console.print(f"[red]Debug info: can_kill={self.can_kill}, api_active={api_is_active}[/red]")
                     if hasattr(self, 'api_server') and self.api_server.running:
                         self.api_server.reset_counters()
                     self.stop_server()
@@ -1013,6 +1051,7 @@ class APIServer:
         self.host = self.cli.config.get("api_host", "0.0.0.0") 
         self.port = self.cli.config.get("api_port", self.cli.default_config["api_port"])
         self.ready_timeout = self.cli.config.get("server_ready_timeout", self.cli.default_config["server_ready_timeout"])
+        self.stream_watchdog_timeout = self.cli.config.get("stream_watchdog_timeout", self.cli.default_config["stream_watchdog_timeout"])
         self.timeout = 30 # Timeout for server requests
         
         # Request tracking
@@ -1096,9 +1135,9 @@ class APIServer:
                 self.cli.llama_server_process is None
                 or self.cli.llama_server_process.poll() is not None
             ):
-                console.print(
-                    f"[yellow]Llama server is stopped. Request for profile '{model}' requires starting it.[/yellow]"
-                )
+                #console.print(
+                #    f"[yellow]Llama server is stopped. Request for profile '{model}' requires starting it.[/yellow]"
+                #)
                 server_needs_start = True
             # --- End: Add check and auto-start logic ---
 
@@ -1161,7 +1200,7 @@ class APIServer:
                     )
                 
                 # Explicitly ensure the inactivity monitor is running
-                console.print("[yellow]Starting inactivity monitor for new model...[/yellow]")
+                # console.print("[yellow]Starting inactivity monitor for new model...[/yellow]")
                 self.cli.start_inactivity_monitor()
 
             # --- End: Modify condition ---
@@ -1186,18 +1225,20 @@ class APIServer:
             # Track active requests
             with self.active_requests_lock:
                 self.active_requests += 1
-            
+                # console.print(f"[dim]API request start: active_requests incremented to {self.active_requests}[/dim]")
+
             is_streaming = request.get("stream", False)
             if is_streaming:
                 with self.active_streams_lock:
                     self.active_streams += 1
+                    # console.print(f"[dim]API stream start: active_streams incremented to {self.active_streams}[/dim]")
 
             # Forward request to the running llama-server
             server_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
-            console.print(f"[yellow]Forwarding request to {server_url}[/yellow]")
-            console.print(
-                f"[yellow]Request payload: {json.dumps(request, indent=2)}[/yellow]"
-            )
+            # console.print(f"[yellow]Forwarding request to {server_url}[/yellow]")
+            # console.print(
+            #     f"[yellow]Request payload: {json.dumps(request, indent=2)}[/yellow]"
+            # )
 
             try:
                 # Start timing for usage metrics
@@ -1381,10 +1422,12 @@ class APIServer:
                             # Decrement active streams counter
                             with self.active_streams_lock:
                                 self.active_streams -= 1
+                                # console.print(f"[dim]API stream end: active_streams decremented to {self.active_streams}[/dim]")
                             
                             # Clean up state after request completes or client disconnects
                             with self.active_requests_lock:
                                 self.active_requests -= 1
+                                # console.print(f"[dim]API request end: active_requests decremented to {self.active_requests}[/dim]")
 
                             # Log completion or disconnection info
                             if not hasattr(response, 'closed') or response.closed:
@@ -1407,7 +1450,7 @@ class APIServer:
                     # Set a timer to ensure the server can be killed if streams get abandoned
                     def stream_watchdog():
                         # Wait a reasonable time for normal streaming completion
-                        stream_timeout = 60  # 60 seconds max wait for natural completion
+                        stream_timeout = self.stream_watchdog_timeout  # Use the configured timeout
                         stream_start = time.time()
                         
                         try:
@@ -1426,17 +1469,19 @@ class APIServer:
                             # Forcibly reset counters to ensure clean exit
                             with self.active_streams_lock:
                                 if self.active_streams > 0:
-                                    # console.print(f"[yellow]Forcing reset of {self.active_streams} abandoned streams[/yellow]")
+                                    console.print(f"[yellow]Stream watchdog: Forcing reset of {self.active_streams} abandoned streams[/yellow]")
                                     self.active_streams = 0
                             
                             with self.active_requests_lock:
                                 if self.active_requests > 0:
-                                    # console.print(f"[yellow]Forcing reset of {self.active_requests} abandoned requests[/yellow]")
+                                    # console.print(f"[yellow]Stream watchdog: Forcing reset of {self.active_requests} abandoned requests[/yellow]")
                                     self.active_requests = 0
                             
-                            # Now set can_kill to true
+                            # When it sets can_kill to true:
+                            previous_state = self.cli.can_kill
                             self.cli.can_kill = True
-                            # console.print("[yellow]Enabling server shutdown after abandoned stream[/yellow]")
+                            # if previous_state != self.cli.can_kill:
+                            #     console.print(f"[yellow]Stream watchdog: Setting can_kill from {previous_state} to {self.cli.can_kill}[/yellow]")
                             
                         except Exception as e:
                             console.print(f"[red]Stream watchdog error: {e}[/red]")
@@ -1540,12 +1585,15 @@ class APIServer:
                 
                 # If there are no active requests or streams, allow the server to be killed
                 if all_done:
+                    previous_state = self.cli.can_kill
                     self.cli.can_kill = True
+                    # if previous_state != self.cli.can_kill:
+                    #     console.print(f"[dim]API completed: Setting can_kill from {previous_state} to {self.cli.can_kill}[/dim]")
 
     def wait_for_server_ready(self):
         """Wait for llama-server to be ready to accept requests"""
         start = time.time()
-        console.print("[yellow]Waiting for server to be ready...[/yellow]")
+        # console.print("[yellow]Waiting for server to be ready...[/yellow]")
         
         while time.time() - start < self.ready_timeout:
             try:
@@ -1565,12 +1613,14 @@ class APIServer:
                 
                 test_res = requests.post(test_url, json=test_payload, timeout=5)
                 if test_res.status_code == 200:
-                    console.print("[green]Server is ready[/green]")
+                    # console.print("[green]Server is ready[/green]")
                     return True
                 else:
-                    console.print(f"[yellow]Server not ready yet. Response: {test_res.status_code}[/yellow]")
+                    # console.print(f"[yellow]Server not ready yet. Response: {test_res.status_code}[/yellow]")
+                    pass
             except requests.RequestException:
-                console.print("[yellow]Waiting for server...[/yellow]")
+                # console.print("[yellow]Waiting for server...[/yellow]")
+                pass
                 
             time.sleep(1)
         
@@ -1589,7 +1639,10 @@ class APIServer:
             self.active_streams = 0
         
         # Enable server shutdown
+        previous_state = self.cli.can_kill
         self.cli.can_kill = True
+        # if previous_state != self.cli.can_kill:
+        #     console.print(f"[dim]Clean exit: Setting can_kill from {previous_state} to {self.cli.can_kill}[/dim]")
 
     def reset_counters(self):
         """Force reset all request and stream counters and enable server shutdown"""
