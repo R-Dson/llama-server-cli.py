@@ -81,22 +81,22 @@ You can also use command-line arguments for specific operations:
 
 ```bash
 # Create a profile
-python llama-server-cli.py profile create my_profile
+python llama-server-cli.py create-profile my_profile
 
 # Set model path
-python llama-server-cli.py profile set my_profile model ./gguf/my_model.gguf
+python llama-server-cli.py set-setting my_profile model ./gguf/my_model.gguf
 
 # See all available profiles
-python llama-server-cli.py profile list
+python llama-server-cli.py list-profiles
 
 # Start server with a specific profile
-python llama-server-cli.py server start --profile my_profile
+python llama-server-cli.py start-server --profile my_profile
 
 # Start OpenAI-compatible API server
-python llama-server-cli.py api start
+python llama-server-cli.py start-api
 
 # Stop API server (if needed)
-python llama-server-cli.py api stop
+python llama-server-cli.py stop-api
 ```
 </details>
 
