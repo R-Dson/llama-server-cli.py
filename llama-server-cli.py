@@ -489,9 +489,10 @@ class LlamaServerCLI:
         """Find and terminate any orphaned llama-server processes"""
         try:
             if os.name == 'posix':  # Linux/Mac
-                # Check for any processes matching the pattern
+                # Check for any processes matching the pattern, but explicitly exclude Python scripts
+                # Use a more specific pattern that won't catch our Python script
                 check_result = subprocess.run(
-                    ["pgrep", "-f", r"\./llama-server"],
+                    ["pgrep", "-f", r"^\./llama-server(\s|$)"],
                     capture_output=True,
                     text=True
                 )
@@ -499,14 +500,14 @@ class LlamaServerCLI:
                 if check_result.returncode == 0 and check_result.stdout.strip():
                     console.print("[yellow]Found orphaned llama-server processes. Terminating...[/yellow]")
                     
-                    # Try SIGTERM first
-                    subprocess.run(["pkill", "-TERM", "-f", r"\./llama-server"], capture_output=True)
+                    # Try SIGTERM first with the more specific pattern
+                    subprocess.run(["pkill", "-TERM", "-f", r"^\./llama-server(\s|$)"], capture_output=True)
                     time.sleep(2)
                     
-                    # Force kill any remaining processes
-                    check_again = subprocess.run(["pgrep", "-f", r"\./llama-server"], capture_output=True)
+                    # Force kill any remaining processes with the more specific pattern
+                    check_again = subprocess.run(["pgrep", "-f", r"^\./llama-server(\s|$)"], capture_output=True)
                     if check_again.returncode == 0:
-                        subprocess.run(["pkill", "-KILL", "-f", r"\./llama-server"], capture_output=True)
+                        subprocess.run(["pkill", "-KILL", "-f", r"^\./llama-server(\s|$)"], capture_output=True)
                         
             elif os.name == 'nt':  # Windows
                 check_result = subprocess.run(
@@ -1122,8 +1123,11 @@ class APIServer:
             current_profile = self.cli.config.get("active_profile", "default")
             profile_needs_switch = model != current_profile
 
-            # --- Modify condition: Start if needed OR switch if running but wrong profile ---
-            if server_needs_start or (profile_needs_switch and not server_needs_start):
+            # Check if we can skip restart because requested profile is already running
+            if not server_needs_start and not profile_needs_switch:
+                console.print(f"[green]Profile '{model}' is already running. Reusing existing server.[/green]")
+            # Only start or switch if necessary
+            elif server_needs_start or profile_needs_switch:
                 # Stop server only if it's running and needs switching
                 if profile_needs_switch and not server_needs_start:
                     console.print(
@@ -1880,7 +1884,8 @@ def restart_inactivity_monitor():
     try:
         if os.name == 'posix':  # Linux/Mac
             check_result = subprocess.run(
-                ["pgrep", "-f", "llama-server"], 
+                # Use the same more specific pattern as in _terminate_orphaned_processes
+                ["pgrep", "-f", r"^\./llama-server(\s|$)"], 
                 capture_output=True, 
                 text=True
             )
@@ -1888,11 +1893,12 @@ def restart_inactivity_monitor():
                 server_running = True
         elif os.name == 'nt':  # Windows
             check_result = subprocess.run(
-                ["tasklist", "/fi", "imagename eq llama-server*"], 
+                # Be more specific with Windows process name
+                ["tasklist", "/fi", "imagename eq llama-server.exe"], 
                 capture_output=True, 
                 text=True
             )
-            if "llama-server" in check_result.stdout:
+            if "llama-server.exe" in check_result.stdout:
                 server_running = True
     except:
         pass
@@ -1917,10 +1923,10 @@ def restart_inactivity_monitor():
     # Reset the process reference if needed by finding the actual PID
     if cli.llama_server_process is None or cli.llama_server_process.poll() is not None:
         try:
-            # Find PID of running llama-server
+            # Find PID of running llama-server with the safer pattern
             if os.name == 'posix':  # Linux/Mac
                 check_result = subprocess.run(
-                    ["pgrep", "-f", "llama-server"], 
+                    ["pgrep", "-f", r"^\./llama-server(\s|$)"], 
                     capture_output=True, 
                     text=True
                 )
