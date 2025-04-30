@@ -86,28 +86,16 @@ class LlamaServerCLI:
             "inactivity_timeout": 300, # how long the entire server stays alive without any new requests
             "server_ready_timeout": 60, 
             "stream_watchdog_timeout": 600, # how long a single streaming response can maximum take
+            "log_llama_server_to_file": False, # Default to console output for llama-server
+            "log_api_server_to_file": False,   # Default to console output for api-server
             "profiles": {"default": {}},
         }
-        
         # Load configuration
         self.config = self.load_config()
         
         # Create server components
         self.server_monitor = ServerMonitor(self)
         self.api_server = APIServer(self)
-
-    def _output_reader(self, process, queue, handle_ending=True):
-        """Common output reading function for process streams"""
-        try:
-            for line in iter(process.stdout.readline, ""):
-                if line:
-                    queue.put(line.rstrip())
-        except Exception as e:
-            queue.put(f"Error reading output: {e}")
-        finally:
-            # Add status message when the process ends
-            if handle_ending:
-                queue.put(("STATUS", "Server process ended"))
 
     def _handle_error(self, operation, error, console_only=False):
         """Common error handling function"""
@@ -359,7 +347,8 @@ class LlamaServerCLI:
             # Exclude CLI/API server specific settings
             "profiles", "active_profile",
             "api_host", "api_port", "inactivity_timeout",
-            "server_ready_timeout", "stream_watchdog_timeout"
+            "server_ready_timeout", "stream_watchdog_timeout",
+            "log_llama_server_to_file", "log_api_server_to_file"
         ]
 
         # Add any custom parameters not already handled
@@ -390,6 +379,7 @@ class LlamaServerCLI:
         """Start the llama-server with the specified profile"""
         # Get settings for the selected profile
         settings = self.get_active_settings(profile_name)
+        log_to_file = settings.get("log_llama_server_to_file", False)
         
         # Validate model path - most critical setting
         if not settings.get("model"):
@@ -405,50 +395,158 @@ class LlamaServerCLI:
             return False
         
         console.print(f"[green]Starting llama-server with command:[/green] {' '.join(args)}")
-        
+
         try:
-            # Start the process
+            log_file_handle = None
+            log_filename = None
+
+            stdout_target = None
+            stderr_target = None
+
+            if log_to_file:
+                # Create logs directory if it doesn't exist
+                os.makedirs("logs", exist_ok=True)
+                # Create log file with timestamp
+                log_filename = f"logs/llama-server-{time.strftime('%Y%m%d-%H%M%S')}.log"
+                log_file_handle = open(log_filename, "w")
+                console.print(f"[green]Server output will be logged to: {log_filename}[/green]")
+                stdout_target = log_file_handle
+                stderr_target = subprocess.STDOUT # Redirect stderr to the same log file
+            else:
+                # If not logging to file
+                if background:
+                    # Suppress output in background mode if not logging to file
+                    stdout_target = subprocess.DEVNULL
+                    stderr_target = subprocess.DEVNULL
+                    console.print("[yellow]Server starting in background (output suppressed).[/yellow]")
+                else:
+                    # In foreground mode without file logging, pipe output to read later
+                    stdout_target = subprocess.PIPE
+                    stderr_target = subprocess.PIPE
+                    console.print("[green]Server starting in foreground (output to console).[/green]")
+                    
+            # Start the process with configured output redirection
             self.llama_server_process = subprocess.Popen(
                 args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+                stdout=stdout_target,
+                stderr=stderr_target,
+                text=True if not log_to_file and not background else False, # Use text mode only for PIPE
                 bufsize=1,
-                universal_newlines=True,
+                universal_newlines=True if not log_to_file and not background else False,
             )
-            
-            # In background mode, start a thread to read output
-            if background and output_queue:
-                reader_thread = threading.Thread(
-                    target=lambda: self._output_reader(self.llama_server_process, output_queue)
-                )
-                reader_thread.daemon = True
-                reader_thread.start()
-                
-                # Start inactivity monitor
+
+            if background:
+                # In background mode, start a thread to read output *only if logging to file*
+                if log_to_file and output_queue and log_filename:
+                    reader_thread = threading.Thread(
+                        target=lambda: self._log_file_reader(log_filename, output_queue)
+                    )
+                    reader_thread.daemon = True
+                    reader_thread.start()
+                # Start inactivity monitor regardless of logging
                 self.start_inactivity_monitor()
                 return True
-                
-            # In foreground mode, print output directly
             else:
-                with console.status("[bold green]Server started. Press Ctrl+C to stop.") as status:
-                    console.print("[bold green]Server started. Press Ctrl+C to stop.[/bold green]")
-                    while self.llama_server_process.poll() is None:
-                        line = self.llama_server_process.stdout.readline()
-                        if line:
-                            console.print(line.rstrip())
-                            
-                # Check exit code
-                if self.llama_server_process.returncode != 0:
-                    console.print(f"[red]Server exited with code {self.llama_server_process.returncode}[/red]")
-                    
+                # In foreground mode
+                if log_to_file and log_filename:
+                    # Just indicate logging and wait for the process
+                    console.print(f"[bold green]Server running. Output logged to {log_filename}. Press Ctrl+C to stop.[/bold green]")
+                    # Wait for the process to finish directly
+                    try:
+                        exit_code = self.llama_server_process.wait()
+                        if exit_code != 0:
+                            console.print(f"[red]Server exited with code {exit_code}[/red]")
+                        else:
+                            console.print("[yellow]Server process ended.[/yellow]")
+                    except KeyboardInterrupt:
+                        console.print("\n[yellow]Stopping server due to Ctrl+C...[/yellow]")
+                        self.stop_server() # Attempt graceful shutdown
+                        console.print("[yellow]Server stopped.[/yellow]")
+                    # Exit code handling is now inside this block.
+
+                elif not log_to_file:
+                    # Read directly from process pipes and print to console
+                    console.print("[bold green]Server running (output to console). Press Ctrl+C to stop.[/bold green]")
+                    try:
+                        # Read stdout
+                        stdout_thread = threading.Thread(target=self._pipe_reader, args=(self.llama_server_process.stdout, "[green][Server][/green] "))
+                        stdout_thread.daemon = True
+                        stdout_thread.start()
+                        # Read stderr
+                        stderr_thread = threading.Thread(target=self._pipe_reader, args=(self.llama_server_process.stderr, "[yellow][Server Status/Error][/yellow] "))
+                        stderr_thread.daemon = True
+                        stderr_thread.start()
+
+                        # Wait for process to finish while threads print output
+                        while self.llama_server_process.poll() is None:
+                            time.sleep(0.2)
+
+                        # Wait for reader threads to finish
+                        stdout_thread.join(timeout=1)
+                        stderr_thread.join(timeout=1)
+
+                    except Exception as e:
+                        console.print(f"[red]Error reading server output pipes: {e}[/red]")
+
+                    # Ensure process is finished before checking code
+                    exit_code = self.llama_server_process.wait()
+                    if exit_code != 0:
+                        console.print(f"[red]Server exited with code {exit_code}[/red]")
+                    else:
+                        console.print("[yellow]Server process ended.[/yellow]")
+
         except Exception as e:
             console.print(f"[red]Error starting server: {e}[/red]")
             if self.llama_server_process:
-                self.stop_server()
+                self.stop_server() # stop_server now handles log file closing
+            elif log_file_handle: # Close handle if Popen failed
+                 try: log_file_handle.close()
+                 except: pass
             return False
-        
+        finally:
+            # Ensure log file handle is closed if it was opened
+            if log_file_handle:
+                try: log_file_handle.close()
+                except: pass
+
         return True
+
+    def _log_file_reader(self, log_filename: str, output_queue: queue.Queue, handle_ending=True):
+        """Read output from log file and put it in the queue"""
+        try:
+            # Open the log file for reading
+            with open(log_filename, "r") as f:
+                # Start at the beginning of the file
+                while True:
+                    # Check if the server is still running
+                    if self.llama_server_process.poll() is not None:
+                        if handle_ending:
+                            output_queue.put(("STATUS", "Server process ended"))
+                        break
+                        
+                    # Read new lines 
+                    line = f.readline()
+                    if line:
+                        output_queue.put(line.rstrip())
+                    else:
+                        # No new lines, sleep briefly and try again
+                        time.sleep(0.1)
+        except Exception as e:
+            output_queue.put(f"Error reading log file: {e}")
+            if handle_ending:
+                output_queue.put(("STATUS", "Server process monitoring ended due to error"))
+
+    def _pipe_reader(self, pipe, prefix=""):
+        """Reads lines from a process pipe and prints them."""
+        try:
+            for line in iter(pipe.readline, ''):
+                if line:
+                    console.print(f"{prefix}{line.rstrip()}")
+            pipe.close()
+        except ValueError: # Handle pipe closed error
+            pass
+        except Exception as e:
+            console.print(f"[red]Error reading pipe: {e}[/red]")
 
     def stop_server(self) -> None:
         """Stop the running llama-server"""
@@ -653,44 +751,78 @@ class LlamaServerCLI:
                         ),
                     ).ask()
 
+                    log_api_to_file = questionary.confirm(
+                        "Log API Server output to file (in logs/)?",
+                        default=bool(self.config.get("log_api_server_to_file", False))
+                    ).ask()
+
+                    log_llama_to_file = questionary.confirm(
+                        "Log Llama Server output to file (in logs/)?",
+                        default=bool(self.config.get("log_llama_server_to_file", False))
+                    ).ask()
+
                     try:
                         api_port = int(api_port)
-                        # Add conversion for server_ready_timeout
                         server_ready_timeout = int(server_ready_timeout_str)
-                        # Add conversion for stream_watchdog_timeout
                         stream_watchdog_timeout = int(stream_watchdog_timeout_str)
+
+                        is_change = (
+                            self.config.get("api_host") != api_host or
+                            self.config.get("api_port") != api_port or
+                            self.config.get("server_ready_timeout") != server_ready_timeout or
+                            self.config.get("streamc_watchdog_timeout") != stream_watchdog_timeout or
+                            self.config.get("log_api_server_to_file") != log_api_to_file or
+                            self.config.get("log_llama_server_to_file") != log_llama_to_file
+                        )
 
                         self.config["api_host"] = api_host
                         self.config["api_port"] = api_port
-                        # Add saving for server_ready_timeout
                         self.config["server_ready_timeout"] = server_ready_timeout
-                        # Add saving for stream_watchdog_timeout
                         self.config["stream_watchdog_timeout"] = stream_watchdog_timeout
-                        self.save_config()
-                        console.print("[green]API server settings updated[/green]")
+                        self.config["log_api_server_to_file"] = log_api_to_file
+                        self.config["log_llama_server_to_file"] = log_llama_to_file
 
-                        # Update API server settings if it's running
-                        if self.api_server.running:
-                            restart = questionary.confirm(
-                                "Restart API server with new settings?"
+                        self.save_config()
+                        console.print("[green]API server and logging settings updated[/green]")
+
+                        # Restart API server if its settings changed and it's running
+                        if is_change and self.api_server.running:
+                             # Check if only llama logging changed - no need to restart API server then
+                             api_settings_changed = (
+                                 self.config.get("api_host") != api_host or
+                                 self.config.get("api_port") != api_port or
+                                 self.config.get("server_ready_timeout") != server_ready_timeout or
+                                 self.config.get("stream_watchdog_timeout") != stream_watchdog_timeout or
+                                 self.config.get("log_api_server_to_file") != log_api_to_file
+                             )
+                             if api_settings_changed:
+                                 restart = questionary.confirm(
+                                     "Restart API server with new settings?"
+                                 ).ask()
+                                 if restart:
+                                     self.api_server.stop()
+                                     # Update the server object with new settings
+                                     self.api_server.host = api_host
+                                     self.api_server.port = api_port
+                                     self.api_server.ready_timeout = server_ready_timeout
+                                     self.api_server.stream_watchdog_timeout = stream_watchdog_timeout
+                                     # No need to update logging flags here, start() reads from config
+                                     self.api_server.start()
+                                     console.print("[green]API server restarted with new settings[/green]")
+
+                        # Restart Llama server if its logging setting changed and it's running
+                        llama_log_setting_changed = self.config.get("log_llama_server_to_file") != log_llama_to_file
+                        if llama_log_setting_changed and self.llama_server_process and self.llama_server_process.poll() is None:
+                            restart_llama = questionary.confirm(
+                                "Restart Llama server with new logging setting?"
                             ).ask()
-                            if restart:
-                                self.api_server.stop()
-                                # Update the server object with new settings
-                                self.api_server.host = api_host
-                                self.api_server.port = api_port
-                                # Add update for ready_timeout
-                                self.api_server.ready_timeout = server_ready_timeout
-                                # Add update for stream_watchdog_timeout
-                                self.api_server.stream_watchdog_timeout = stream_watchdog_timeout
-                                self.api_server.start()
-                                console.print(
-                                    "[green]API server restarted with new settings[/green]"
-                                )
+                            if restart_llama:
+                                active_profile = self.config.get("active_profile", "default")
+                                self.restart_server_seamless(active_profile) # restart_server_seamless handles stop/start
+
                     except ValueError:
-                        # Update error message slightly
                         self._handle_error(
-                            "updating API settings",
+                            "updating settings",
                             "Port and Timeout values must be numbers",
                             True,
                         )
@@ -803,7 +935,6 @@ class LlamaServerCLI:
                 profile_settings = self.config.get("profiles", {}).get(profile_name, {})
                 all_settings = self.get_active_settings(profile_name)
 
-                # Common settings to configure (ordered by importance)
                 common_settings = [
                     "model",
                     "ctx_size", 
@@ -956,7 +1087,7 @@ class LlamaServerCLI:
         
         # Log the state change for debugging
         # if previous_state != self.can_kill:
-        #     console.print(f"[dim]Inactivity monitor: Setting can_kill from {previous_state} to {self.can_kill}[/dim]")
+        #     pass # console.print(f"[dim]Inactivity monitor: Setting can_kill from {previous_state} to {self.can_kill}[/dim]")
 
     def _inactivity_monitor_loop(self):
         """Monitor inactivity and shut down server when idle for too long"""
@@ -1032,6 +1163,7 @@ class APIServer:
         self.ready_timeout = self.cli.config.get("server_ready_timeout", self.cli.default_config["server_ready_timeout"])
         self.stream_watchdog_timeout = self.cli.config.get("stream_watchdog_timeout", self.cli.default_config["stream_watchdog_timeout"])
         self.timeout = 30 # Timeout for server requests
+        self.log_file = None
         
         # Request tracking
         self.active_requests = 0
@@ -1643,28 +1775,119 @@ class APIServer:
 
     def start(self):
         if not self.running:
-            self.running = True
-            self.server = uvicorn.Server(
-                config=uvicorn.Config(
-                    app=self.app,
-                    host=self.host,
-                    port=self.port,
-                    log_level="info",
-                    access_log=True,  # Enable access logs
-                    timeout_keep_alive=5,  # Reduce keep-alive timeout
-                    timeout_graceful_shutdown=10,  # Grace period for shutdown
+            try:
+                log_to_file = self.cli.config.get("log_api_server_to_file", False)
+                log_filename = None
+                log_config = None # Default to Uvicorn's console logging
+
+                # Create logs directory if it doesn't exist
+                os.makedirs("logs", exist_ok=True)
+
+                if log_to_file:
+                    # Create log file with timestamp for the API server
+                    log_filename = f"logs/api-server-{time.strftime('%Y%m%d-%H%M%S')}.log"
+                    # Open the handle for potential direct writes in _run_server
+                    try:
+                        self.log_file = open(log_filename, "w")
+                        console.print(f"[green]API server output will be logged to: {log_filename}[/green]")
+                    except Exception as e:
+                        console.print(f"[red]Error opening API log file {log_filename}: {e}[/red]")
+                        self.log_file = None # Ensure handle is None if open failed
+                        log_to_file = False # Fallback to console logging
+
+                    # Configure Uvicorn logging only if file was opened successfully
+                    if self.log_file:
+                        import logging # Ensure logging is imported
+                        from uvicorn.config import LOGGING_CONFIG
+                        import copy # Import copy module
+
+                        log_config = copy.deepcopy(LOGGING_CONFIG)
+                        log_config["handlers"]["api_file"] = {
+                            "class": "logging.FileHandler",
+                            "formatter": "default",
+                            "filename": log_filename,
+                        }
+                        log_config["loggers"]["uvicorn"] = {
+                            "handlers": ["api_file"], "level": "INFO", "propagate": False
+                        }
+                        log_config["loggers"]["uvicorn.error"] = {
+                            "handlers": ["api_file"], "level": "INFO", "propagate": False
+                        }
+                        log_config["loggers"]["uvicorn.access"] = {
+                            "handlers": ["api_file"], "level": "INFO", "propagate": False
+                        }
+                else:
+                    console.print("[green]API server logging to console.[/green]")
+                    self.log_file = None # Ensure log_file is None when not logging to file
+
+                self.running = True
+                self.server = uvicorn.Server(
+                    config=uvicorn.Config(
+                        app=self.app,
+                        host=self.host,
+                        port=self.port,
+                        log_level="info",
+                        access_log=True,
+                        log_config=log_config, # Pass None to use Uvicorn defaults (console)
+                        timeout_keep_alive=5,
+                        timeout_graceful_shutdown=10,
+                    )
                 )
-            )
-            self.thread = Thread(target=self._run_server)
-            self.thread.start()
-            self.cli.console.print(
-                f"[green]API server started on {self.host}:{self.port}[/green]"
-            )
+
+                self.thread = Thread(target=self._run_server)
+                self.thread.start()
+                console.print(
+                    f"[green]API server started on {self.host}:{self.port}[/green]"
+                )
+            except Exception as e:
+                self.cli._handle_error("starting API server", e, True)
+                self.running = False
+                # Ensure log file handle is closed on error
+                if hasattr(self, 'log_file') and self.log_file:
+                    try: self.log_file.close()
+                    except: pass
+                    self.log_file = None
 
     def _run_server(self):
+        log_to_file = self.cli.config.get("log_api_server_to_file", False)
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        target_stream = None
+        devnull_handle = None # Keep track if we open devnull
+
+        if log_to_file:
+            # Try to use the configured log file
+            if hasattr(self, 'log_file') and self.log_file and not self.log_file.closed:
+                target_stream = self.log_file
+                # console.print("[dim]API Server: Redirecting output to log file.[/dim]", file=original_stderr) # Debug
+            else:
+                # Fallback if log file wasn't opened correctly
+                print("[red]Error: API log file handle not available. Suppressing API output.[/red]", file=original_stderr)
+                log_to_file = False # Force fallback to devnull
+
+        # If file logging is disabled (either by config or fallback)
+        if not log_to_file:
+            try:
+                devnull_handle = open(os.devnull, 'w')
+                target_stream = devnull_handle
+                # console.print("[dim]API Server: Redirecting output to os.devnull.[/dim]", file=original_stderr) # Debug
+            except OSError as e:
+                print(f"[red]Error opening os.devnull: {e}. API output might appear on console.[/red]", file=original_stderr)
+                target_stream = None # Avoid redirection if devnull fails
+
         try:
+            redirected = False
+            if target_stream:
+                sys.stdout = target_stream
+                sys.stderr = target_stream
+                redirected = True
+
+            # Uvicorn server runs here
             self.server.run()
+
         except OSError as e:
+            # Log errors to original stderr before restoring, as current stderr goes to file
+            print(f"[Error running API server OS Error]: {e}", file=original_stderr)
             if "address already in use" in str(e):
                 self.cli._handle_error(
                     "starting API server", f"Port {self.port} already in use!", True
@@ -1672,30 +1895,47 @@ class APIServer:
             else:
                 self.cli._handle_error("running API server", e, True)
         except (BrokenPipeError, ConnectionResetError, socket.error) as e:
-            # These are expected when client disconnects abruptly
-            self.cli.console.print(
-                f"[yellow]Client connection error in server: {str(e)}[/yellow]"
+            # Log connection errors to original stderr
+            print(f"[Client connection error in server]: {str(e)}", file=original_stderr)
+            print(
+                "This is likely due to a client disconnection and is not a serious issue.", file=original_stderr
             )
-            self.cli.console.print(
-                "This is likely due to a client disconnection and is not a serious issue."
-            )
-            # Don't report this as an error - just log it
+            # Attempt to continue if possible
             if self.running:
-                # Try to keep the server running if possible
-                self.cli.console.print(
-                    "[yellow]Attempting to continue server operation...[/yellow]"
-                )
+                 print("[Attempting to continue server operation...]", file=original_stderr)
         except Exception as e:
+             # Log other exceptions to original stderr
+            print(f"[Error running API server Exception]: {e}", file=original_stderr)
             self.cli._handle_error("running API server", e, True)
         finally:
-            self.running = False
+            if redirected: # Only restore if we actually redirected
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+
+            self.running = False # This should be outside the conditional block
+
+            # Close the log file handle *only* if it was the target and it's the instance's handle
+            if target_stream is self.log_file and hasattr(self, 'log_file') and self.log_file:
+                 try:
+                     self.log_file.close()
+                     self.log_file = None # Clear handle after closing
+                 except Exception as e:
+                     print(f"[red]Error closing API log file: {e}[/red]", file=original_stderr)
+
+            # Close the devnull handle if it was opened
+            if devnull_handle:
+                try:
+                    devnull_handle.close()
+                except Exception:
+                    pass # Ignore errors closing devnull
 
     def stop(self):
         if self.running:
             self.running = False
-            self.server.should_exit = True
-            self.thread.join()
-
+            if self.server: # Check if server object exists
+                self.server.should_exit = True
+            if self.thread: # Check if thread exists
+                self.thread.join(timeout=10) # Add timeout
 
 class ServerMonitor:
     """Simple monitor for capturing server output to a queue"""
@@ -1707,9 +1947,13 @@ class ServerMonitor:
         self.monitor_thread = None
         self.server_output = []
         self.max_log_lines = 20  # Maximum number of log lines to display
+        self.current_log_file = None
 
     def start(self, profile_name: str) -> bool:
         """Start server with the specified profile and capture output"""
+        settings = self.cli.get_active_settings(profile_name)
+        log_to_file = settings.get("log_llama_server_to_file", False)
+        
         # Start the server
         success = self.cli.start_server(
             profile_name, background=True, output_queue=self.output_queue
@@ -1720,11 +1964,16 @@ class ServerMonitor:
         self.running = True
         self.server_output = []  # Clear previous output
 
-        # Start the monitoring thread
-        self.monitor_thread = threading.Thread(target=self._monitor_loop)
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
-        
+        if log_to_file:
+            # Start the monitoring thread only if logging to file
+            self.monitor_thread = threading.Thread(target=self._monitor_loop)
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+            self.server_output.append("[dim]Monitoring server log file...[/dim]")
+        else:
+            # Indicate that monitoring is not active
+            self.server_output.append("[yellow]Logging to file disabled - output not monitored.[/yellow]")
+
         return True
 
     def stop(self) -> None:
