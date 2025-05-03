@@ -27,6 +27,8 @@
 
 ## Installation
 
+0. Compile `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp). If compiling works, and you are using Nvidia CUDA, you can try using `llama-server-help-script/compile-llama-server.sh`.
+
 1. Place the `llama-server-cli.py` file in the same directory as your `llama-server` executable.
 
 2. Install the required Python packages:
