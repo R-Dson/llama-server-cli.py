@@ -40,7 +40,29 @@ pip install typer rich questionary prompt_toolkit fastapi uvicorn
 ```bash
 mkdir -p gguf
 ```
+4. (Optional) Download a GGUF model file using the `pull-gguf.sh` script.
+<details>
 
+<summary>
+Either of the following commands will work.
+
+</summary>
+
+```
+# File URL
+./llama-server-help-script/pull-gguf.sh https://huggingface.co/USER/MODEL/resolve/main/MODEL_FILE_NAME.gguf
+
+# Model URL and file name
+./llama-server-help-script/pull-gguf.sh https://huggingface.co/USER/MODEL MODEL_FILE_NAME.gguf
+
+# User/model and file name
+./llama-server-help-script/pull-gguf.sh USER/MODEL MODEL_FILE_NAME.gguf
+
+# User/model/file name
+./llama-server-help-script/pull-gguf.sh USER/MODEL/MODEL_FILE_NAME.gguf
+```
+
+</details>
 
 ## Recommended Directory Structure
 

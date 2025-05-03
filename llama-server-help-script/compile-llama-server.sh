@@ -49,4 +49,4 @@ fi
 mv "./build/bin/$BUILD_TARGET" "$FINAL_BUILD_TARGET_PATH/$BUILD_TARGET"
 
 # Clean up
-rm -rf ./build
+# rm -rf ./build

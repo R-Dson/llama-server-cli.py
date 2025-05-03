@@ -178,3 +178,5 @@ llama-server
 gguf*
 *.jinja
 .aider*
+logs*
+llama.cpp/
