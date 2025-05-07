@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import glob
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid  # Added for tool call IDs
 from threading import Thread
 from typing import Any, Dict, List, Optional
 
@@ -1393,6 +1395,20 @@ class APIServer:
         if model not in self.cli.config.get("profiles", {}):
             raise HTTPException(404, "Profile not found")
 
+        # Check for unsupported combination early
+        is_streaming = request.get("stream", False)
+        has_tools = bool(request.get("tools"))
+        
+        # Llama.cpp does not support tool calls in streaming mode
+        # You will just get: Cannot use tools with stream
+
+        # We need to detect if we need to simulate streaming for tools
+        simulate_streaming = is_streaming and has_tools
+        
+        if simulate_streaming:
+            console.print("[yellow]Client requested streaming with tools - llama.cpp doesn't support this combination.[/yellow]")
+            console.print("[yellow]Simulating streaming response by chunking a non-streaming response...[/yellow]")
+
         with self.lock:
             # --- Start: Add check and auto-start logic ---
             server_needs_start = False
@@ -1503,6 +1519,13 @@ class APIServer:
                     self.active_streams += 1
                     # console.print(f"[dim]API stream start: active_streams incremented to {self.active_streams}[/dim]")
 
+            # Create a copy of the request for llama.cpp
+            llama_payload = request.copy()
+            
+            # If we need to simulate streaming, remove stream flag for llama.cpp request
+            if simulate_streaming:
+                llama_payload["stream"] = False
+
             # Forward request to the running llama-server
             server_url = f"http://{self.cli.config['host']}:{self.cli.config['port']}/v1/chat/completions"
             # console.print(f"[yellow]Forwarding request to {server_url}[/yellow]")
@@ -1517,25 +1540,72 @@ class APIServer:
 
                 # For streaming requests, use stream=True
                 is_streaming = request.get("stream", False)
+                
+                # Set appropriate socket timeout
+                # Use a much longer timeout for simulated streaming because we need to wait for complete model response
+                if simulate_streaming:
+                    # For simulated streaming, we need a much longer timeout (5 minutes) to get the full response
+                    request_timeout = 600  # 5 minutes for simulated streaming with tools
+                    console.print(f"[yellow]Using extended timeout ({request_timeout}s) for simulated streaming with tools[/yellow]")
+                elif is_streaming:
+                    # For regular streaming, shorter timeout is fine as we process chunks incrementally
+                    request_timeout = 10  # Slightly longer than before for streaming
+                else:
+                    # For normal non-streaming requests
+                    request_timeout = self.timeout
 
-                # Set shorter socket timeout for streaming to detect disconnects faster
-                request_timeout = 5 if is_streaming else self.timeout
+                # Special handling for simulate_streaming case to catch timeouts
+                if simulate_streaming:
+                    try:
+                        console.print(f"[yellow]Making non-streaming request to llama.cpp for simulated streaming...[/yellow]")
+                        response = requests.post(
+                            server_url,
+                            json=llama_payload,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Accept": "application/json",
+                            },
+                            timeout=request_timeout,
+                            stream=False,
+                        )
+                        # Record load time (time to first response)
+                        load_duration = time.time() - load_start_time
+                        console.print(f"[green]Received complete response from llama.cpp in {load_duration:.2f}s[/green]")
+                        try:
+                            raw_response_data_for_simulate_streaming = response.json()
+                            console.print(f"[cyan][DIAGNOSTIC] Raw llama.cpp response (for simulate_streaming):\n{json.dumps(raw_response_data_for_simulate_streaming, indent=2)}[/cyan]")
+                        except json.JSONDecodeError:
+                            console.print(f"[red][DIAGNOSTIC] Failed to decode JSON from llama.cpp response. Status: {response.status_code}, Text: {response.text[:500]}...[/red]")
+                            raw_response_data_for_simulate_streaming = None # Ensure it's defined
 
-                response = requests.post(
-                    server_url,
-                    json=request,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "text/event-stream"
-                        if is_streaming
-                        else "application/json",
-                    },
-                    timeout=request_timeout,  # Use shorter timeout for streaming
-                    stream=is_streaming,
-                )
-
-                # Record load time (time to first response)
-                load_duration = time.time() - load_start_time
+                    except requests.exceptions.Timeout:
+                        console.print(f"[red]Request to llama.cpp timed out after {request_timeout}s when preparing for simulated streaming[/red]")
+                        console.print(f"[yellow]The model is taking too long to generate a complete response with tool calls.[/yellow]")
+                        console.print(f"[yellow]Recommend using non-streaming mode with tools for this model.[/yellow]")
+                        raise HTTPException(
+                            504,  # Gateway Timeout
+                            "Request timed out. The model is taking too long to generate a complete response with tool calls. Try without streaming."
+                        )
+                    except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+                        console.print(f"[red]Connection error when preparing for simulated streaming: {str(e)}[/red]")
+                        self._check_and_kill_server_on_error()
+                        raise HTTPException(503, f"Could not connect to llama-server: {str(e)}. Is it running?")
+                else:
+                    # Normal request handling for non-simulated cases
+                    response = requests.post(
+                        server_url,
+                        json=llama_payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "text/event-stream"
+                            if (is_streaming and not simulate_streaming)
+                            else "application/json",
+                        },
+                        timeout=request_timeout, 
+                        stream=(is_streaming and not simulate_streaming),
+                    )
+                    # Record load time (time to first response)
+                    load_duration = time.time() - load_start_time
 
                 # Check for error response
                 if response.status_code != 200:
@@ -1556,8 +1626,259 @@ class APIServer:
                     )
                     raise HTTPException(500, f"Llama server error: {error_details}")
 
-                # For streaming responses, return a StreamingResponse
-                if is_streaming:
+                # For simulated streaming responses (tools + stream), manually break up the response
+                if simulate_streaming:
+                    # Use the logged raw_response_data_for_simulate_streaming if available
+                    response_json = raw_response_data_for_simulate_streaming if raw_response_data_for_simulate_streaming is not None else response.json()
+                    total_duration = time.time() - start_time
+                    
+                    console.print(f"[green]Successfully generated complete tool call response in {round(total_duration, 2)} seconds[/green]")
+                    console.print(f"[yellow]Now simulating streaming of tool calls to client...[/yellow]")
+                    
+                    async def simulated_stream_generator():
+                        try:
+                            # 1. Get the complete response from llama.cpp
+                            if not response_json.get("choices"):
+                                console.print("[red]Failed to get valid response for simulated streaming[/red]")
+                                console.print(f"[yellow]Response from llama.cpp: {json.dumps(response_json, indent=2)}[/yellow]")
+                                
+                                # Try to return a meaningful error to the client
+                                error_msg = "Invalid response from language model server"
+                                if "error" in response_json:
+                                    error_msg = response_json.get("error", {}).get("message", error_msg)
+                                
+                                # Send error as an event
+                                yield f"data: {json.dumps({'error': error_msg})}\n\n".encode("utf-8")
+                                yield b"data: [DONE]\n\n"
+                                return
+                            
+                            # 2. Extract the message content
+                            llama_choice = response_json.get("choices", [{}])[0]
+                            llama_message = llama_choice.get("message", {})
+                            llama_finish_reason = llama_choice.get("finish_reason")
+                            
+                            # Construct base response template - ensure consistent fields with OpenAI spec
+                            base_chunk = {
+                                "id": response_json.get("id", f"chatcmpl-{uuid.uuid4()}"),
+                                "object": "chat.completion.chunk",
+                                "created": response_json.get("created", int(time.time())),
+                                "model": response_json.get("model", model),
+                                "system_fingerprint": response_json.get("system_fingerprint", "fp_" + model.replace("-", "_").lower()),
+                            }
+                            
+                            # 3. First yield the role
+                            role_chunk = base_chunk.copy()
+                            role_chunk["choices"] = [{
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None
+                            }]
+                            yield f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8")
+                            await asyncio.sleep(0.01)  # Small delay to simulate streaming
+                            
+                            # 4. If this is a tool call
+                            if llama_message.get("tool_calls") or llama_finish_reason == "tool_calls":
+                                llama_tool_calls = llama_message.get("tool_calls", [])
+                                
+                                # For each tool call, yield in chunks
+                                for tc_index, tc in enumerate(llama_tool_calls):
+                                    # Ensure we have function details and arguments
+                                    function_details = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                                    arguments = function_details.get("arguments", "")
+                                    # Ensure arguments is a string
+                                    if not isinstance(arguments, str):
+                                        try:
+                                            arguments = json.dumps(arguments)
+                                        except TypeError:
+                                            arguments = "{}"
+                                    
+                                    # Generate tool ID if missing
+                                    tool_id = tc.get("id", f"call_{uuid.uuid4()}")
+                                    
+                                    # Initial tool call chunk (with name and ID)
+                                    tool_init_chunk = base_chunk.copy()
+                                    tool_init_chunk["choices"] = [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tc_index,
+                                                "id": tool_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": function_details.get("name", ""),
+                                                    "arguments": ""
+                                                }
+                                            }]
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                    yield f"data: {json.dumps(tool_init_chunk)}\n\n".encode("utf-8")
+                                    await asyncio.sleep(0.03)  # Slightly longer delay for tool init
+                                    
+                                    # Chunk the arguments (roughly character by character or small groups)
+                                    # This simulates how the arguments would be streamed
+                                    chunk_size = 4  # Small chunks to simulate realistic streaming
+                                    for i in range(0, len(arguments), chunk_size):
+                                        arg_chunk = arguments[i:i+chunk_size]
+                                        arg_delta_chunk = base_chunk.copy()
+                                        arg_delta_chunk["choices"] = [{
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [{
+                                                    "index": tc_index,
+                                                    "function": {
+                                                        "arguments": arg_chunk
+                                                    }
+                                                }]
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                        yield f"data: {json.dumps(arg_delta_chunk)}\n\n".encode("utf-8")
+                                        await asyncio.sleep(0.02)  # Small delay between argument chunks
+                                    
+                                    # Add a slightly longer delay after arguments complete
+                                    # This helps clients properly finish processing the tool call arguments
+                                    await asyncio.sleep(0.1)
+                            
+                            # 5. If this is regular content
+                            elif llama_message.get("content"):
+                                content = llama_message.get("content", "")
+                                # Chunk the content (roughly character by character or small groups)
+                                chunk_size = 4  # Small chunks to simulate streaming
+                                for i in range(0, len(content), chunk_size):
+                                    content_chunk = content[i:i+chunk_size]
+                                    content_delta_chunk = base_chunk.copy()
+                                    content_delta_chunk["choices"] = [{
+                                        "index": 0,
+                                        "delta": {"content": content_chunk},
+                                        "finish_reason": None
+                                    }]
+                                    yield f"data: {json.dumps(content_delta_chunk)}\n\n".encode("utf-8")
+                                    await asyncio.sleep(0.02)  # Small delay between content chunks
+                            
+                            # 6. Prepare usage info (moved to be populated before creating the final chunk)
+                            info = {}
+                            # Extract usage info from response_json["usage"]
+                            if "usage" in response_json:
+                                info.update({
+                                    "prompt_tokens": response_json["usage"].get("prompt_tokens", 0),
+                                    "completion_tokens": response_json["usage"].get("completion_tokens", 0),
+                                    "total_tokens": response_json["usage"].get("total_tokens", 0),
+                                })
+                            
+                            # Extract timing info if available from response_json["timings"]
+                            if "timings" in response_json:
+                                timings = response_json["timings"]
+                                # Convert milliseconds to seconds where needed
+                                info.update({
+                                    "prompt_eval_count": timings.get("prompt_n", 0),
+                                    "prompt_eval_duration": round(timings.get("prompt_ms", 0) / 1000, 2),
+                                    "eval_count": timings.get("predicted_n", 0),
+                                    "eval_duration": round(timings.get("predicted_ms", 0) / 1000, 2),
+                                    "tokens_per_second": round(timings.get("predicted_per_second", 0), 2),
+                                })
+                                
+                            # Add timing information we tracked
+                            info.update({
+                                "total_duration": round(total_duration, 2),
+                                "load_duration": round(load_duration, 2),
+                            })
+
+                            # 7. Final chunk with finish_reason and combined usage info
+                            final_chunk_payload = base_chunk.copy()
+                            final_reason = "tool_calls" if llama_message.get("tool_calls") else llama_finish_reason
+                            final_chunk_payload["choices"] = [{
+                                "index": 0,
+                                "delta": {}, # Delta is empty for the final chunk
+                                "finish_reason": final_reason
+                            }]
+                            if info: # Add usage to the final chunk if info is populated
+                                final_chunk_payload["usage"] = info
+                            
+                            yield f"data: {json.dumps(final_chunk_payload)}\n\n".encode("utf-8")
+                            
+                            # The separate yield for usage info and associated sleeps have been removed.
+                            
+                            # Finally, send [DONE]
+                            yield b"data: [DONE]\n\n"
+                            
+                        except Exception as e:
+                            console.print(f"[red]Error in simulated streaming: {type(e).__name__}: {e}[/red]")
+                            import traceback
+                            traceback.print_exc()
+                            # Try to gracefully end the stream
+                            yield b"data: [DONE]\n\n"
+                        finally:
+                            # Clean up counters
+                            with self.active_streams_lock:
+                                self.active_streams -= 1
+                                if self.active_streams < 0:
+                                    self.active_streams = 0
+                    
+                    # Create and return the streaming response
+                    response_obj = StreamingResponse(
+                        simulated_stream_generator(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no"
+                        }
+                    )
+                    
+                    # Set a timer to ensure the server can be killed if streams get abandoned
+                    def stream_watchdog():
+                        # Wait a reasonable time for normal streaming completion
+                        stream_timeout = (
+                            self.stream_watchdog_timeout
+                        )  # Use the configured timeout
+                        stream_start = time.time()
+
+                        try:
+                            # Wait for either stream completion or timeout
+                            while time.time() - stream_start < stream_timeout:
+                                # Check if we've completed normally
+                                with self.active_streams_lock:
+                                    if self.active_streams == 0:
+                                        # console.print("[dim]Stream completed normally.[/dim]")
+                                        return
+                                time.sleep(1)
+
+                            # If we're here, watchdog timed out - handle abandoned stream
+                            # console.print("[yellow]Stream watchdog: Stream may be abandoned.[/yellow]")
+
+                            # Forcibly reset counters to ensure clean exit
+                            with self.active_streams_lock:
+                                if self.active_streams > 0:
+                                    console.print(
+                                        f"[yellow]Stream watchdog: Forcing reset of {self.active_streams} abandoned streams[/yellow]"
+                                    )
+                                    self.active_streams = 0
+
+                            with self.active_requests_lock:
+                                if self.active_requests > 0:
+                                    # console.print(f"[yellow]Stream watchdog: Forcing reset of {self.active_requests} abandoned requests[/yellow]")
+                                    self.active_requests = 0
+
+                            # When it sets can_kill to true:
+                            previous_state = self.cli.can_kill
+                            self.cli.can_kill = True
+                            # if previous_state != self.cli.can_kill:
+                            #     console.print(f"[yellow]Stream watchdog: Setting can_kill from {previous_state} to {self.cli.can_kill}[/yellow]")
+
+                        except Exception as e:
+                            console.print(f"[red]Stream watchdog error: {e}[/red]")
+
+                    # Start watchdog in background thread
+                    watchdog = threading.Thread(target=stream_watchdog)
+                    watchdog.daemon = True
+                    watchdog.start()
+
+                    # Return the streaming response
+                    return response_obj
+
+                # For regular streaming responses, use server-provided streaming
+                elif is_streaming:
                     # Initialize tracking variables
                     has_usage = False
                     has_timings = False
@@ -1679,11 +2000,11 @@ class APIServer:
                             )
 
                             # Send a final data message with usage info
-                            final_message = json.dumps({"usage": info})
-                            yield f"data: {final_message}\n\n".encode("utf-8")
+                            # final_message = json.dumps({"usage": info})
+                            # yield f"data: {final_message}\n\n".encode("utf-8")
 
                             # Send the standard [DONE] signal as the very last message
-                            yield b"data: [DONE]\n\n"
+                            yield "data: [DONE]\n\n"
 
                             # console.print(
                             #     f"[green]Stream completed. Usage info: {json.dumps(info, indent=2)}[/green]"
@@ -1790,6 +2111,45 @@ class APIServer:
                 response_json = response.json()
                 total_duration = time.time() - start_time
 
+                if response_json.get("choices") and len(response_json["choices"]) > 0:
+                    llama_choice = response_json["choices"][0]
+                    llama_message = llama_choice.get("message", {})
+                    llama_finish_reason = llama_choice.get("finish_reason")
+
+                    # Check for tool calls
+                    if llama_message.get("tool_calls") or llama_finish_reason == "tool_calls":
+                        openai_tool_calls = []
+                        # Process each tool call
+                        llama_tc_list = llama_message.get("tool_calls", [])
+                        for i, tc in enumerate(llama_tc_list):
+                            # Get function details
+                            function_details = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                            # Ensure arguments are a JSON string
+                            arguments = function_details.get("arguments", "")
+                            if not isinstance(arguments, str):
+                                try:
+                                    arguments = json.dumps(arguments)
+                                except (TypeError, ValueError):
+                                    arguments = "{}"
+
+                            # Create OpenAI-compatible tool call
+                            openai_tool_calls.append({
+                                "id": tc.get("id", f"call_{uuid.uuid4()}"),
+                                "type": "function",
+                                "function": {
+                                    "name": function_details.get("name", ""),
+                                    "arguments": arguments
+                                }
+                            })
+
+                        # Update the response format for OpenAI compatibility
+                        response_json["choices"][0]["message"] = {
+                            "role": llama_message.get("role", "assistant"),
+                            "content": None,  # Must be null when tool_calls are present
+                            "tool_calls": openai_tool_calls
+                        }
+                        response_json["choices"][0]["finish_reason"] = "tool_calls"
+
                 # Create info field for client expected format
                 info = {}
 
@@ -1842,9 +2202,9 @@ class APIServer:
                     response_json["usage"] = {}
                 response_json["usage"].update(info)
 
-                console.print(
-                    f"[green]Request completed. Usage info: {json.dumps(info, indent=2)}[/green]"
-                )
+                # console.print(
+                #     f"[green]Request completed. Usage info: {json.dumps(info, indent=2)}[/green]"
+                # )
                 return response_json
 
             except (
@@ -1952,6 +2312,31 @@ class APIServer:
         self.cli.can_kill = True
         # if previous_state != self.cli.can_kill:
         #     console.print(f"[dim]Clean exit: Setting can_kill from {previous_state} to {self.cli.can_kill}[/dim]")
+        
+    def _check_and_kill_server_on_error(self):
+        """Checks server status after connection error and attempts kill if unresponsive."""
+        if self.cli.llama_server_process and self.cli.llama_server_process.poll() is not None:
+            console.print("[yellow]Server process already exited after connection error.[/yellow]")
+            self.cli.llama_server_process = None  # Ensure state is clean
+            return
+
+        if self.cli.llama_server_process:
+            console.print("[yellow]Attempting to terminate unresponsive server after connection error...[/yellow]")
+            try:
+                # Send SIGTERM first
+                self.cli.llama_server_process.terminate()
+                try:
+                    self.cli.llama_server_process.wait(timeout=3)  # Short wait for terminate
+                    console.print("[green]Server terminated gracefully after error.[/green]")
+                except subprocess.TimeoutExpired:
+                    console.print("[yellow]Server did not terminate gracefully, sending SIGKILL...[/yellow]")
+                    self.cli.llama_server_process.kill()
+                    self.cli.llama_server_process.wait(timeout=3)  # Wait for kill
+                    console.print("[green]Server killed after error.[/green]")
+            except Exception as e:
+                console.print(f"[red]Error trying to terminate/kill server process: {e}[/red]")
+            finally:
+                self.cli.llama_server_process = None  # Mark as stopped
 
     def reset_counters(self):
         """Force reset all request and stream counters and enable server shutdown"""
@@ -1983,7 +2368,7 @@ class APIServer:
                     log_filename = (
                         f"logs/api-server-{time.strftime('%Y%m%d-%H%M%S')}.log"
                     )
-                    # Open the handle for potential direct writes in _run_server
+                    # Open the handle for potential writes in _run_server
                     try:
                         self.log_file = open(log_filename, "w")
                         console.print(
