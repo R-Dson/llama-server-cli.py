@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Add more targets if needed
-BUILD_TARGET="llama-server"
+BUILD_TARGET="llama-server llama-cli"
 # Change this if needed
 FINAL_BUILD_TARGET_PATH="../"
 
@@ -42,11 +42,11 @@ nice cmake --build ./build --config Release -j $NUM_THREADS --clean-first --targ
 
 # Print version
 if [[ "${BUILD_TARGET,,}" == *"llama-server"* ]]; then
-    ./build/bin/$BUILD_TARGET --version | grep 'version: '
+    ./build/bin/llama-server --version | grep 'version: '
+    mv ./build/bin/llama-server "$FINAL_BUILD_TARGET_PATH/$BUILD_TARGET"
 fi
 
 # Move binary
-mv "./build/bin/$BUILD_TARGET" "$FINAL_BUILD_TARGET_PATH/$BUILD_TARGET"
 
 # Clean up
 # rm -rf ./build
