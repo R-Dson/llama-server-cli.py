@@ -1,7 +1,7 @@
 # Llama Server CLI
 
 
-### A simple, user-friendly CLI tool for managing, and running, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) with multiple configuration profiles and providing OpenAI-compatible API access.
+A simple, user-friendly CLI tool for managing, and running, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) with multiple configuration profiles and providing OpenAI-compatible API access.
 
 <details>
 <summary>
@@ -15,15 +15,15 @@
 </details>
 
 ## Key Features
-*   **Simple Single-File Deployment** - easy to deploy and get started.
-*   **Interactive Menus** - navigate options intuitively using arrow or number keys.
-*   **Multiple Configuration Profiles** - easily manage and switch between different setups.
-*   **Background Server Operation** - the server runs unobtrusively in the background.
-*   **Automatic Model Discovery** - automatically finds and selects compatible models.
-*   **Instant Config Changes** - apply settings immediately via profile switching or direct edits.
-*   **Automated Config File** - the configuration file is managed automatically for you.
-*   **Automatic Server Management** - handles seamless restarts on changes and cleanup on exit.
-*   **OpenAI-Compatible API** - provides an interface compatible with OpenAI standards. (Still some TODO)
+*   **Simple Single-File Deployment** - run everything from one file with minimal setup.
+*   **Interactive Menus** - Navigation with arrow keys or numbered options.
+*   **Model Specific Profiles** - create and switch between different model configurations effortlessly.
+*   **OpenAI-Compatible API** - use your local models with any application supporting OpenAI's API format. (TODO)
+*   **Streaming for Tool Calls** - Simulates streaming 
+responses for function calling even though it is not 
+natively supported in llama.cpp.
+*   **Instant Config Changes** - settings take effect immediately when switching or editing profiles.
+*   **Auto-Managed Configs** - The profiles files are created and updated automatically—no manual edits needed.
 
 ## Installation
 
@@ -147,7 +147,8 @@ The tool includes an OpenAI-compatible API server that allows you to use your lo
 1. **API Configuration**: Configure the API server host and port through the interactive menu or config.json
 2. **Automatic Profile Switching**: The API server automatically switches between profiles based on the requested model
 3. **Chat Completions**: Supports the `/v1/chat/completions` endpoint with streaming capabilities
-4. **Models Endpoint**: Exposes profiles as models via the `/v1/models` endpoint
+4. **Tools Support**: Simulates streaming for tool calls (function calling) even though llama.cpp doesn't natively support this combination
+5. **Models Endpoint**: Exposes profiles as models via the `/v1/models` endpoint
 
 ## Background Server Operation
 
