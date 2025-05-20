@@ -3,7 +3,7 @@
 # Add more targets if needed
 BUILD_TARGET="llama-server llama-cli"
 # Change this if needed
-FINAL_BUILD_TARGET_PATH="../"
+FINAL_BUILD_TARGET_PATH=".."
 
 LLAMA_CPP_DIR="./llama.cpp"
 CCACHE_EXISTS=$(command -v ccache &> /dev/null && echo "true" || echo "false")
@@ -43,7 +43,8 @@ nice cmake --build ./build --config Release -j $NUM_THREADS --clean-first --targ
 # Print version
 if [[ "${BUILD_TARGET,,}" == *"llama-server"* ]]; then
     ./build/bin/llama-server --version | grep 'version: '
-    mv ./build/bin/llama-server "$FINAL_BUILD_TARGET_PATH/$BUILD_TARGET"
+    echo "$FINAL_BUILD_TARGET_PATH/llama-server"
+    mv ./build/bin/llama-server "$FINAL_BUILD_TARGET_PATH/llama-server"
 fi
 
 # Move binary
