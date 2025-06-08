@@ -1,4 +1,8 @@
-# Llama Server CLI
+
+# This project have evolved! It can now be found on [R-Dson/llamate](https://github.com/R-Dson/llamate).
+
+
+## Llama Server CLI
 
 
 A simple, user-friendly CLI tool for managing, and running, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) with multiple configuration profiles and providing OpenAI-compatible API access.
